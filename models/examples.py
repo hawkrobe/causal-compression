@@ -8,10 +8,11 @@ Functions:
     build_complex_medical_dag: T -> Y <- M (with moderator)
     build_mask_advice_dag: R, M -> I (context-dependent mask effect)
     build_drug_marker_scenario: Returns (true_dag, utterances) tuple for demos
+    build_trust_update_scenario: Returns dict with everything needed for trust demos
 """
 
 import numpy as np
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 from .dag import Variable, CausalDAG
 from .speaker import Utterance
@@ -217,3 +218,90 @@ def build_drug_marker_scenario() -> Tuple[CausalDAG, List[Utterance]]:
     ]
 
     return true_dag, utterances
+
+
+def build_trust_update_scenario() -> Dict:
+    """
+    Returns everything needed for RSA trust-update demonstrations.
+
+    Returns dict with:
+        'simple_dag':  CausalDAG  D -> Y (no moderator, drug always works)
+        'complex_dag': CausalDAG  G -> Y <- D (drug effect depends on marker)
+        'utterances':  List[Utterance]  shared 2-utterance set
+        'effect_var':  'Y'
+        'contexts':    [{'G': 0}, {'G': 1}]
+
+    The simple-world DAG has no G variable.  When RSATrustModel filters
+    context to variables in the DAG, the simple-world speaker sees an
+    empty context and always produces the same utterance probabilities
+    regardless of which context the listener observes.
+
+    The complex-world DAG is the standard G -> Y <- D from
+    build_drug_marker_scenario.
+    """
+    # ---- shared utterance DAGs (D -> Y only) ----------------------------
+    vars_dy = {'D': Variable('D', (0, 1)), 'Y': Variable('Y', (0, 1))}
+    parents_dy = {'D': [], 'Y': ['D']}
+
+    def cpt_D(p):
+        return np.array([0.5, 0.5])
+
+    def cpt_Y_works(p):
+        if p['D'] == 1:
+            return np.array([0.1, 0.9])   # drug works well
+        return np.array([0.5, 0.5])
+
+    def cpt_Y_doesnt(p):
+        if p['D'] == 1:
+            return np.array([0.8, 0.2])   # drug doesn't help
+        return np.array([0.5, 0.5])
+
+    dag_works = CausalDAG(vars_dy, parents_dy, {'D': cpt_D, 'Y': cpt_Y_works})
+    dag_doesnt = CausalDAG(vars_dy, parents_dy, {'D': cpt_D, 'Y': cpt_Y_doesnt})
+
+    utterances = [
+        Utterance("drug_works", dag_works, "stability"),
+        Utterance("drug_doesnt_work", dag_doesnt, "stability"),
+    ]
+
+    # ---- simple-world DAG: D -> Y, drug has consistent positive effect ---
+    def cpt_Y_simple(p):
+        if p['D'] == 1:
+            return np.array([0.15, 0.85])  # drug works (close to "drug_works" utterance)
+        return np.array([0.55, 0.45])
+
+    simple_dag = CausalDAG(vars_dy, parents_dy, {'D': cpt_D, 'Y': cpt_Y_simple})
+
+    # ---- complex-world DAG: G -> Y <- D ---------------------------------
+    vars_gdy = {
+        'G': Variable('G', (0, 1)),
+        'D': Variable('D', (0, 1)),
+        'Y': Variable('Y', (0, 1)),
+    }
+    parents_gdy = {'G': [], 'D': [], 'Y': ['G', 'D']}
+
+    def cpt_G(p):
+        return np.array([0.5, 0.5])
+
+    def cpt_Y_complex(p):
+        g, d = p['G'], p['D']
+        if g == 1 and d == 1:
+            return np.array([0.1, 0.9])
+        elif g == 1 and d == 0:
+            return np.array([0.4, 0.6])
+        elif g == 0 and d == 1:
+            return np.array([0.8, 0.2])
+        else:
+            return np.array([0.6, 0.4])
+
+    complex_dag = CausalDAG(
+        vars_gdy, parents_gdy, {'G': cpt_G, 'D': cpt_D, 'Y': cpt_Y_complex}
+    )
+
+    return {
+        'simple_dag': simple_dag,
+        'complex_dag': complex_dag,
+        'utterances': utterances,
+        'effect_var': 'Y',
+        'contexts': [{'G': 0}, {'G': 1}],
+    }

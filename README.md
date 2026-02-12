@@ -11,8 +11,8 @@ pip install -e .
 ## Quick start
 
 ```python
-from causal_compression import CompressionSpeaker, TrustModel
-from causal_compression.examples import build_drug_marker_scenario
+from models import CompressionSpeaker, TrustModel, RSATrustModel
+from models.examples import build_drug_marker_scenario, build_trust_update_scenario
 
 # Drug effectiveness depends on a genetic marker
 true_dag, utterances = build_drug_marker_scenario()
@@ -27,6 +27,15 @@ simple = TrustModel.create_simple_believer(reliability_prior=0.8)
 complex = TrustModel.create_complex_believer(reliability_prior=0.8)
 simple.update('revision')['trust_delta']   # negative
 complex.update('revision')['trust_delta']  # positive
+
+# RSA-derived trust: likelihoods computed from speaker model, not hand-coded
+scenario = build_trust_update_scenario()
+rsa = RSATrustModel(
+    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+    utterances=scenario['utterances'],
+    effect_var='Y',
+    prior_world={'simple': 0.5, 'complex': 0.5},
+)
 ```
 
 See `notebooks/demonstrations.qmd` for worked examples with visualizations.

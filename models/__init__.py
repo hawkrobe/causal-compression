@@ -30,8 +30,14 @@ from .speaker import Utterance, CompressionSpeaker
 # Listener models
 from .listener import CompressionListener, TrustModel
 
+# RSA trust model (requires memo-lang + jax)
+from .rsa import RSATrustModel
+
 # Analysis tools
-from .analysis import compute_rate_distortion_curve, plot_rate_distortion_curve
+from .analysis import (
+    compute_rate_distortion_curve,
+    compute_trust_curve,
+)
 
 # Example DAG builders
 from .examples import (
@@ -39,6 +45,7 @@ from .examples import (
     build_complex_medical_dag,
     build_mask_advice_dag,
     build_drug_marker_scenario,
+    build_trust_update_scenario,
 )
 
 __all__ = [
@@ -58,12 +65,14 @@ __all__ = [
     # Listener
     'CompressionListener',
     'TrustModel',
+    'RSATrustModel',
     # Analysis
     'compute_rate_distortion_curve',
-    'plot_rate_distortion_curve',
+    'compute_trust_curve',
     # Examples
     'build_simple_medical_dag',
     'build_complex_medical_dag',
     'build_mask_advice_dag',
     'build_drug_marker_scenario',
+    'build_trust_update_scenario',
 ]

@@ -9,16 +9,19 @@ jupyter: python3
 
 ```{python}
 import sys
-sys.path.insert(0, '../src')
+sys.path.insert(0, '..')
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-from causal_compression import (
+from models import (
     Variable, CausalDAG, Utterance,
     CompressionSpeaker, TrustModel,
-    compute_rate_distortion_curve, plot_rate_distortion_curve,
-    build_drug_marker_scenario
+    RSATrustModel,
+    compute_rate_distortion_curve,
+    compute_trust_curve,
+    build_drug_marker_scenario,
+    build_trust_update_scenario,
 )
 ```
 
@@ -203,6 +206,233 @@ print(f"Distortion range: [{rd_data['distortion'].min():.3f}, {rd_data['distorti
 #| fig-cap: "Rate-distortion trade-off curve"
 #| label: fig-rate-distortion
 
-fig, axes = plot_rate_distortion_curve(rd_data, figsize=(14, 4))
+fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+
+ax = axes[0]
+ax.plot(rd_data['rate'], rd_data['distortion'], 'b-', linewidth=2)
+ax.set_xlabel('Rate (bits)')
+ax.set_ylabel('Distortion (bits)')
+ax.set_title('Rate-Distortion Trade-off')
+ax.grid(True, alpha=0.3)
+
+ax = axes[1]
+ax.semilogx(rd_data['alpha'], rd_data['rate'], 'g-', linewidth=2)
+ax.set_xlabel(r'$\alpha$ (rationality)')
+ax.set_ylabel('Rate (bits)')
+ax.set_title('Rate vs Rationality')
+ax.grid(True, alpha=0.3)
+
+ax = axes[2]
+ax.semilogx(rd_data['alpha'], rd_data['distortion'], 'r-', linewidth=2)
+ax.set_xlabel(r'$\alpha$ (rationality)')
+ax.set_ylabel('Distortion (bits)')
+ax.set_title('Distortion vs Rationality')
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+## RSA-Derived Trust Updates
+
+The `RSATrustModel` derives speaker likelihoods from `CompressionSpeaker` rather than hand-coding them. The listener jointly infers world complexity and speaker reliability via the memo RSA model.
+
+```{python}
+scenario = build_trust_update_scenario()
+
+rsa_model = RSATrustModel(
+    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+    utterances=scenario['utterances'],
+    effect_var=scenario['effect_var'],
+    prior_world={'simple': 0.5, 'complex': 0.5},
+    prior_reliable=0.8,
+    speaker_alpha=10.0,
+    contexts=scenario['contexts'],
+)
+
+print("Derived likelihoods P(u | world, reliability, context):")
+for ctx_label, ctx in [("G=0", {'G': 0}), ("G=1", {'G': 1})]:
+    for utt in scenario['utterances']:
+        lk = rsa_model.get_derived_likelihoods(ctx, utt.name)
+        print(f"\n  P({utt.name} | context={ctx_label}):")
+        for (w, r), p in sorted(lk.items()):
+            print(f"    {w:>8s}, {r:>12s}: {p:.4f}")
+```
+
+### Opposite trust updates for simple vs complex believers
+
+```{python}
+observations = [
+    ({'G': 1}, 'drug_works'),
+    ({'G': 0}, 'drug_doesnt_work'),
+]
+
+# Simple believer
+rsa_simple = RSATrustModel(
+    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+    utterances=scenario['utterances'],
+    effect_var='Y',
+    prior_world={'simple': 0.9, 'complex': 0.1},
+    prior_reliable=0.8,
+    speaker_alpha=10.0,
+    contexts=scenario['contexts'],
+)
+result_rsa_simple = rsa_simple.update(observations)
+
+# Complex believer
+rsa_complex = RSATrustModel(
+    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+    utterances=scenario['utterances'],
+    effect_var='Y',
+    prior_world={'simple': 0.1, 'complex': 0.9},
+    prior_reliable=0.8,
+    speaker_alpha=10.0,
+    contexts=scenario['contexts'],
+)
+result_rsa_complex = rsa_complex.update(observations)
+
+print("RSA-derived trust updates after context-dependent revision:")
+print(f"\nSimple believer (P(complex)=0.1):")
+print(f"  Trust: {result_rsa_simple['prior_reliable']:.3f} -> {result_rsa_simple['posterior_reliable']:.3f} (delta={result_rsa_simple['trust_delta']:+.3f})")
+print(f"  Complexity: {result_rsa_simple['prior_complex']:.3f} -> {result_rsa_simple['posterior_complex']:.3f}")
+
+print(f"\nComplex believer (P(complex)=0.9):")
+print(f"  Trust: {result_rsa_complex['prior_reliable']:.3f} -> {result_rsa_complex['posterior_reliable']:.3f} (delta={result_rsa_complex['trust_delta']:+.3f})")
+print(f"  Complexity: {result_rsa_complex['prior_complex']:.3f} -> {result_rsa_complex['posterior_complex']:.3f}")
+```
+
+## Trust as a Function of Complexity Prior
+
+Sweeping P(C=complex) from 0 to 1 reveals a crossover: listeners who believe the world is simple lose trust after revision, while listeners who believe the world is complex gain trust.
+
+```{python}
+prior_range = np.linspace(0.05, 0.95, 40)
+
+trust_data = compute_trust_curve(
+    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+    utterances=scenario['utterances'],
+    effect_var='Y',
+    observations=observations,
+    prior_complex_range=prior_range,
+    prior_reliable=0.8,
+    speaker_alpha=10.0,
+    contexts=scenario['contexts'],
+)
+```
+
+```{python}
+#| fig-cap: "Trust delta vs complexity prior — the signature crossover"
+#| label: fig-trust-crossover
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+pc = trust_data['prior_complex']
+td = trust_data['trust_delta']
+
+ax.plot(pc, td, 'b-', linewidth=2)
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+
+# Find and annotate crossover
+sign_changes = np.where(np.diff(np.sign(td)))[0]
+if len(sign_changes) > 0:
+    idx = sign_changes[0]
+    x0, x1 = pc[idx], pc[idx + 1]
+    y0, y1 = td[idx], td[idx + 1]
+    crossover = x0 - y0 * (x1 - x0) / (y1 - y0)
+    ax.plot(crossover, 0, 'ro', markersize=10)
+    ax.annotate(
+        f'crossover: P(complex)={crossover:.2f}',
+        xy=(crossover, 0),
+        xytext=(crossover + 0.1, max(td) * 0.3),
+        arrowprops=dict(arrowstyle='->', color='red'),
+        fontsize=10, color='red',
+    )
+
+ax.set_xlabel('P(world = complex)', fontsize=12)
+ax.set_ylabel('Trust delta after revision', fontsize=12)
+ax.set_title('RSA-Derived Trust Predictions', fontsize=14)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Effect of Explanation
+
+When the speaker provides an explanation (shifting the listener's prior toward "complex world"), the trust-damaging effect of revision is reduced. We model explanation as a log-odds shift toward P(C=complex) before the Bayesian update.
+
+```{python}
+#| fig-cap: "Explanation shifts the trust curve upward"
+#| label: fig-explanation-effect
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+for strength, color, label in [(0, 'blue', 'No explanation'),
+                                (1.0, 'orange', 'Moderate explanation'),
+                                (2.0, 'green', 'Strong explanation')]:
+    deltas = []
+    for p_complex in prior_range:
+        m = RSATrustModel(
+            world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+            utterances=scenario['utterances'],
+            effect_var='Y',
+            prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
+            prior_reliable=0.8,
+            speaker_alpha=10.0,
+            contexts=scenario['contexts'],
+        )
+        if strength == 0:
+            r = m.update(observations)
+        else:
+            r = m.update_with_explanation(observations, explanation_strength=strength)
+        deltas.append(r['trust_delta'])
+
+    ax.plot(prior_range, deltas, color=color, linewidth=2, label=label)
+
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('P(world = complex)', fontsize=12)
+ax.set_ylabel('Trust delta after revision', fontsize=12)
+ax.set_title('Effect of Explanation on Trust', fontsize=14)
+ax.legend(fontsize=11)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Comparison: Derived vs Hand-Coded Likelihoods
+
+The hand-coded `TrustModel` uses stipulated likelihoods. The `RSATrustModel` derives them from the speaker's compression behavior. Here we overlay both to show they agree qualitatively but differ in magnitude.
+
+```{python}
+#| fig-cap: "RSA-derived vs hand-coded trust models"
+#| label: fig-derived-vs-handcoded
+
+fig, ax = plt.subplots(figsize=(8, 5))
+
+# RSA-derived curve (already computed)
+ax.plot(trust_data['prior_complex'], trust_data['trust_delta'],
+        'b-', linewidth=2, label='RSA-derived')
+
+# Hand-coded curve
+hc_deltas = []
+for p_complex in prior_range:
+    tm = TrustModel(
+        prior_world_complex=float(p_complex),
+        prior_reliable=0.8,
+    )
+    r = tm.update('revision')
+    hc_deltas.append(r['trust_delta'])
+
+ax.plot(prior_range, hc_deltas, 'r--', linewidth=2, label='Hand-coded')
+
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
+ax.set_xlabel('P(world = complex)', fontsize=12)
+ax.set_ylabel('Trust delta after revision', fontsize=12)
+ax.set_title('Derived vs Hand-Coded Trust Models', fontsize=14)
+ax.legend(fontsize=11)
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
 plt.show()
 ```

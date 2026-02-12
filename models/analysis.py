@@ -3,7 +3,7 @@ Analysis tools for causal compression models.
 
 Functions:
     compute_rate_distortion_curve: Compute the Rate-Distortion trade-off
-    plot_rate_distortion_curve: Visualize the trade-off (requires matplotlib)
+    compute_trust_curve: Sweep P(C=complex) and compute trust_delta
 """
 
 import numpy as np
@@ -88,55 +88,55 @@ def compute_rate_distortion_curve(
     }
 
 
-def plot_rate_distortion_curve(
-    rd_data: Dict[str, np.ndarray],
-    save_path: Optional[str] = None,
-    figsize: tuple = (15, 4)
-):
+def compute_trust_curve(
+    world_dags: Dict[str, CausalDAG],
+    utterances: List[Utterance],
+    effect_var: str,
+    observations: List[tuple],
+    prior_complex_range: np.ndarray,
+    prior_reliable: float = 0.8,
+    speaker_alpha: float = 10.0,
+    contexts: List[Dict[str, int]] = None,
+) -> Dict[str, np.ndarray]:
     """
-    Plot the Rate-Distortion curve.
+    Sweep P(C=complex) from 0 to 1 and compute trust_delta at each value.
 
-    Requires matplotlib (optional dependency).
+    Uses RSATrustModel (memo-based) for each prior value.
 
     Args:
-        rd_data: Dict from compute_rate_distortion_curve
-        save_path: Optional path to save figure
-        figsize: Figure size tuple (width, height)
+        world_dags: {'simple': dag, 'complex': dag}
+        utterances: Shared 2-utterance set
+        effect_var: Outcome variable name
+        observations: List of (context_dict, utterance_name) pairs
+        prior_complex_range: Array of P(C=complex) values to sweep
+        prior_reliable: Prior P(speaker = reliable)
+        speaker_alpha: Rationality parameter
+        contexts: List of context dicts for speaker table precomputation
+
+    Returns:
+        Dict with 'prior_complex', 'trust_delta', 'complexity_delta' arrays
     """
-    try:
-        import matplotlib.pyplot as plt
-    except ImportError:
-        raise ImportError("matplotlib is required for plotting. Install with: pip install matplotlib")
+    from .rsa import RSATrustModel
 
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    trust_deltas = []
+    complexity_deltas = []
 
-    # Rate vs Distortion
-    ax = axes[0]
-    ax.plot(rd_data['rate'], rd_data['distortion'], 'b-', linewidth=2)
-    ax.set_xlabel('Rate (bits)')
-    ax.set_ylabel('Distortion (bits)')
-    ax.set_title('Rate-Distortion Trade-off')
-    ax.grid(True, alpha=0.3)
+    for p_complex in prior_complex_range:
+        model = RSATrustModel(
+            world_dags=world_dags,
+            utterances=utterances,
+            effect_var=effect_var,
+            prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
+            prior_reliable=prior_reliable,
+            speaker_alpha=speaker_alpha,
+            contexts=contexts,
+        )
+        result = model.update(observations)
+        trust_deltas.append(result['trust_delta'])
+        complexity_deltas.append(result['complexity_delta'])
 
-    # Rate vs Alpha
-    ax = axes[1]
-    ax.semilogx(rd_data['alpha'], rd_data['rate'], 'g-', linewidth=2)
-    ax.set_xlabel(r'$\alpha$ (rationality)')
-    ax.set_ylabel('Rate (bits)')
-    ax.set_title('Rate vs Rationality')
-    ax.grid(True, alpha=0.3)
-
-    # Distortion vs Alpha
-    ax = axes[2]
-    ax.semilogx(rd_data['alpha'], rd_data['distortion'], 'r-', linewidth=2)
-    ax.set_xlabel(r'$\alpha$ (rationality)')
-    ax.set_ylabel('Distortion (bits)')
-    ax.set_title('Distortion vs Rationality')
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-
-    return fig, axes
+    return {
+        'prior_complex': np.array(prior_complex_range),
+        'trust_delta': np.array(trust_deltas),
+        'complexity_delta': np.array(complexity_deltas),
+    }

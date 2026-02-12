@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Causal compression model for speaker-listener communication"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "Your Name", email = "your.email@example.com" }
 ]
@@ -18,14 +18,14 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
 ]
 dependencies = [
     "numpy>=1.20",
     "scipy>=1.7",
+    "jax>=0.4",
+    "memo-lang>=1.2",
 ]
 
 [project.optional-dependencies]
@@ -41,8 +41,7 @@ plot = [
 Repository = "https://github.com/yourusername/causal-compression"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/causal_compression"]
+packages = ["models"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
