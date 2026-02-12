@@ -389,21 +389,28 @@ class TestRSATrustModel:
         beliefs = model.get_beliefs()
         total = sum(beliefs.values())
         assert np.isclose(total, 1.0, atol=1e-6)
-        assert len(beliefs) == 6  # 2 worlds x 3 goals
+        assert len(beliefs) == 8  # 2 worlds x 4 goals
 
     def test_initial_marginals(self, model):
         """Initial marginals should match the priors."""
-        # Default prior_goal is uniform 1/3 each, so P(informative) = 1/3
-        assert np.isclose(model.get_reliability_belief(), 1 / 3, atol=1e-6)
+        # Default prior_goal is uniform 1/4 each, so P(informative) = 1/4
+        assert np.isclose(model.get_reliability_belief(), 1 / 4, atol=1e-6)
         assert np.isclose(model.get_complexity_belief(), 0.5, atol=1e-6)
 
     def test_goal_beliefs(self, model):
         """Goal beliefs should match prior and sum to 1."""
         goals = model.get_goal_beliefs()
-        assert set(goals.keys()) == {'informative', 'persuade_up', 'persuade_down'}
+        assert set(goals.keys()) == {'informative', 'persuade_up', 'persuade_down', 'unreliable'}
         assert np.isclose(sum(goals.values()), 1.0, atol=1e-6)
         for g in goals.values():
-            assert np.isclose(g, 1 / 3, atol=1e-6)
+            assert np.isclose(g, 1 / 4, atol=1e-6)
+
+    def test_unreliable_speaker_uniform(self, model):
+        """Unreliable speaker likelihoods should be uniform (0.5 each)."""
+        for ctx in [{'G': 0}, {'G': 1}]:
+            lk = model.get_derived_likelihoods(ctx, 'drug_works')
+            assert np.isclose(lk[('simple', 'unreliable')], 0.5, atol=1e-6)
+            assert np.isclose(lk[('complex', 'unreliable')], 0.5, atol=1e-6)
 
     def test_informative_likelihoods_match_speaker(self, scenario, model):
         """Informative speaker likelihoods should match CompressionSpeaker probs."""
@@ -528,7 +535,7 @@ class TestRSATrustModel:
         """reset() should restore initial beliefs."""
         model.update([({'G': 1}, 'drug_works')])
         model.reset()
-        assert np.isclose(model.get_reliability_belief(), 1 / 3, atol=1e-6)
+        assert np.isclose(model.get_reliability_belief(), 1 / 4, atol=1e-6)
         assert np.isclose(model.get_complexity_belief(), 0.5, atol=1e-6)
 
 

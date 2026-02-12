@@ -21,15 +21,17 @@ class Utt(IntEnum):
 
 
 class Goal(IntEnum):
-    """Speaker goal types following the persuasive RSA pattern.
+    """Speaker goal types.
 
     - INFORMATIVE: minimize information loss (standard RSA)
     - PERSUADE_UP: maximize listener's belief that outcome Y=1
     - PERSUADE_DOWN: maximize listener's belief that outcome Y=0
+    - UNRELIABLE: uniform random over utterances (incompetent/noisy)
     """
     INFORMATIVE = 0
     PERSUADE_UP = 1
     PERSUADE_DOWN = 2
+    UNRELIABLE = 3
 
 
 N_GOALS = len(Goal)
@@ -38,20 +40,22 @@ N_GOALS = len(Goal)
 class WG(IntEnum):
     """Joint state: (world_type, goal) packed into a single index.
        w: 0 = simple, 1 = complex
-       g: 0 = informative, 1 = persuade_up, 2 = persuade_down
+       g: 0 = informative, 1 = persuade_up, 2 = persuade_down, 3 = unreliable
        Packing: s = w * N_GOALS + g  ->  w = s // N_GOALS,  g = s % N_GOALS
     """
     SIMPLE_INFORMATIVE = 0
     SIMPLE_PERSUADE_UP = 1
     SIMPLE_PERSUADE_DOWN = 2
-    COMPLEX_INFORMATIVE = 3
-    COMPLEX_PERSUADE_UP = 4
-    COMPLEX_PERSUADE_DOWN = 5
+    SIMPLE_UNRELIABLE = 3
+    COMPLEX_INFORMATIVE = 4
+    COMPLEX_PERSUADE_UP = 5
+    COMPLEX_PERSUADE_DOWN = 6
+    COMPLEX_UNRELIABLE = 7
 
 
 N_STATES = len(WG)
 
-GOAL_NAMES = ['informative', 'persuade_up', 'persuade_down']
+GOAL_NAMES = ['informative', 'persuade_up', 'persuade_down', 'unreliable']
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +86,7 @@ def rsa_trust[s: WG, u: Utt](prior: ..., speaker_table: ..., c):
     Implements the vigilant listener from the persuasive RSA framework:
         P_L1(w, psi | u) proportional to P(w) * P(psi) * P_S1(u | w, psi, c)
 
-    where psi in {informative, persuade_up, persuade_down}.
+    where psi in {informative, persuade_up, persuade_down, unreliable}.
 
     Returns |WG| x |Utt| array where [s, u] = P(state=s | observed u, context c).
     """
@@ -118,9 +122,10 @@ def _compute_expected_outcome(dag: CausalDAG, effect_var: str,
 # ---------------------------------------------------------------------------
 
 DEFAULT_PRIOR_GOAL = {
-    'informative': 1 / 3,
-    'persuade_up': 1 / 3,
-    'persuade_down': 1 / 3,
+    'informative': 1 / 4,
+    'persuade_up': 1 / 4,
+    'persuade_down': 1 / 4,
+    'unreliable': 1 / 4,
 }
 
 
@@ -129,29 +134,22 @@ DEFAULT_PRIOR_GOAL = {
 # ---------------------------------------------------------------------------
 
 class RSATrustModel:
-    """RSA-derived trust model with persuasive speaker types.
+    """RSA-derived trust model with multiple speaker types.
 
-    Extends the standard RSA framework to speakers with potentially
-    persuasive goals, following the persuasive RSA pattern:
+    The listener jointly infers world complexity and speaker goal type:
 
-        Speaker types (Eq. 1):
-        - Informative (psi=inf):  P(u|w,c) proportional to exp[-alpha * KL(P_true || P_compressed)]
-        - Persuade-up (psi=pers+): P(u|w,c) proportional to exp[alpha * E[Y=1|u,c]]
-        - Persuade-down (psi=pers-): P(u|w,c) proportional to exp[alpha * E[Y=0|u,c]]
+        Speaker types:
+        - Informative:    P(u|w,c) proportional to exp[-alpha * KL(P_true || P_compressed)]
+        - Persuade-up:    P(u|w,c) proportional to exp[alpha * E[Y=1|u,c]]
+        - Persuade-down:  P(u|w,c) proportional to exp[alpha * E[Y=0|u,c]]
+        - Unreliable:     P(u|w,c) = 1/|U|  (uniform random)
 
-        Vigilant listener (Eq. 2):
+        Vigilant listener:
         P_L1(w, psi | u) proportional to P(w) * P(psi) * P_S1(u | w, psi, c)
 
     The listener jointly infers:
     - world complexity (simple vs complex causal structure)
-    - speaker goal (informative vs persuasive)
-
-    Key predictions:
-    - Revision (changing advice across contexts) strongly signals
-      (complex world, informative speaker).
-    - Consistency is ambiguous: could be (simple, informative) or
-      (any world, persuasive).  Whether consistent advice increases
-      or decreases trust depends on the complexity prior.
+    - speaker type (informative, persuasive, or unreliable)
     """
 
     def __init__(
@@ -231,18 +229,22 @@ class RSATrustModel:
                 persuade_up_table[wi, ci, :] = probs_up
                 persuade_down_table[wi, ci, :] = probs_down
 
+        # Unreliable speaker: uniform random, independent of world and context
+        unreliable_table = np.full((n_worlds, n_ctx, n_utt), 1.0 / n_utt)
+
         # Pack into [N_STATES, n_ctx, n_utt]
         # State packing: s = w * N_GOALS + g
+        goal_tables = {
+            Goal.INFORMATIVE: informative_table,
+            Goal.PERSUADE_UP: persuade_up_table,
+            Goal.PERSUADE_DOWN: persuade_down_table,
+            Goal.UNRELIABLE: unreliable_table,
+        }
         speaker_table_np = np.zeros((N_STATES, n_ctx, n_utt))
         for wi in range(n_worlds):
             for gi in range(N_GOALS):
                 si = wi * N_GOALS + gi
-                if gi == Goal.INFORMATIVE:
-                    speaker_table_np[si] = informative_table[wi]
-                elif gi == Goal.PERSUADE_UP:
-                    speaker_table_np[si] = persuade_up_table[wi]
-                elif gi == Goal.PERSUADE_DOWN:
-                    speaker_table_np[si] = persuade_down_table[wi]
+                speaker_table_np[si] = goal_tables[Goal(gi)][wi]
 
         self._speaker_table = jnp.array(speaker_table_np)
 

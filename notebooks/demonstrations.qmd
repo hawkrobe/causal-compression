@@ -2,10 +2,19 @@
 title: "Causal Compression Demonstrations"
 format:
   html:
-    code-fold: false
+    code-fold: true
     toc: true
 jupyter: python3
 ---
+
+## When does simplifying causal knowledge backfire?
+
+Experts compress complex causal knowledge into simple advice. A doctor who knows a drug's effectiveness depends on a genetic marker might just say "take the drug" or "don't take the drug." This compression is *context-dependent*: the same expert gives different advice to different patients, not because they're unreliable, but because the underlying causal structure demands it.
+
+The problem: a listener who doesn't know the causal structure might interpret context-sensitive advice as a sign the speaker is confused, unreliable, or manipulative. Whether compression backfires depends on:
+
+1. **Complexity prior** — does the listener expect the world to be simple or complex?
+2. **Vigilance** — does the listener entertain non-informative speaker types (persuasive, unreliable)?
 
 ```{python}
 import sys
@@ -17,7 +26,7 @@ import matplotlib.pyplot as plt
 from models import (
     Variable, CausalDAG, Utterance,
     CompressionSpeaker,
-    RSATrustModel,
+    RSATrustModel, Goal,
     compute_rate_distortion_curve,
     compute_trust_curve,
     build_drug_marker_scenario,
@@ -25,9 +34,9 @@ from models import (
 )
 ```
 
-## Context-Dependent Compression
+## The Speaker's Compression Problem
 
-A doctor advises patients about a drug treatment whose effectiveness depends on a genetic marker (G). G=1: drug is highly effective (90% success). G=0: drug is ineffective (20% success).
+A drug's effectiveness depends on a genetic marker G. G=1: 90% success. G=0: 20% success. The speaker must compress this into one of two utterances.
 
 ```{python}
 true_dag, utterances = build_drug_marker_scenario()
@@ -39,43 +48,17 @@ speaker = CompressionSpeaker(
     alpha=10.0
 )
 
-print(f"Available utterances: {[u.name for u in utterances]}")
-```
-
-### Patient has the genetic marker
-
-```{python}
 context_marker = {'G': 1}
+context_no_marker = {'G': 0}
+
 losses_marker = speaker.compute_losses(context_marker)
 probs_marker = speaker.get_utterance_probs(context_marker)
-optimal_marker = speaker.get_optimal_utterance(context_marker)
 
-print("Context: G=1")
-print("\nInformation losses (KL divergence):")
-for u, l in losses_marker.items():
-    print(f"  {u}: {l:.4f} bits")
-print("\nUtterance probabilities:")
-for u, p in probs_marker.items():
-    print(f"  {u}: {p:.4f}")
-print(f"\nOptimal utterance: '{optimal_marker.name}'")
-```
-
-### Patient lacks the genetic marker
-
-```{python}
-context_no_marker = {'G': 0}
 losses_no_marker = speaker.compute_losses(context_no_marker)
 probs_no_marker = speaker.get_utterance_probs(context_no_marker)
-optimal_no_marker = speaker.get_optimal_utterance(context_no_marker)
 
-print("Context: G=0")
-print("\nInformation losses (KL divergence):")
-for u, l in losses_no_marker.items():
-    print(f"  {u}: {l:.4f} bits")
-print("\nUtterance probabilities:")
-for u, p in probs_no_marker.items():
-    print(f"  {u}: {p:.4f}")
-print(f"\nOptimal utterance: '{optimal_no_marker.name}'")
+print(f"G=1 → optimal: '{speaker.get_optimal_utterance(context_marker).name}'")
+print(f"G=0 → optimal: '{speaker.get_optimal_utterance(context_no_marker).name}'")
 ```
 
 ```{python}
@@ -121,7 +104,7 @@ plt.show()
 
 ## Rate-Distortion Trade-off
 
-The rationality parameter $\alpha$ controls the trade-off between utterance complexity (rate) and expected information loss (distortion). $\alpha \to 0$ gives a uniform distribution; $\alpha \to \infty$ gives deterministic selection of the optimal utterance.
+$\alpha$ controls the trade-off between utterance complexity (rate) and information loss (distortion).
 
 ```{python}
 contexts = [{'G': 0}, {'G': 1}]
@@ -133,9 +116,6 @@ rd_data = compute_rate_distortion_curve(
     contexts=contexts,
     alpha_range=np.logspace(-1, 2, 50)
 )
-
-print(f"Rate range: [{rd_data['rate'].min():.3f}, {rd_data['rate'].max():.3f}] bits")
-print(f"Distortion range: [{rd_data['distortion'].min():.3f}, {rd_data['distortion'].max():.3f}] bits")
 ```
 
 ```{python}
@@ -169,166 +149,193 @@ plt.tight_layout()
 plt.show()
 ```
 
-## Persuasive RSA Trust Model
+## Credulous vs Vigilant Listener
 
-The `RSATrustModel` extends RSA to speakers with potentially persuasive goals. The listener jointly infers world complexity and speaker goal type $\psi \in \{\text{informative}, \text{persuade-up}, \text{persuade-down}\}$.
+Two listener types observe the same advice:
+
+- **Credulous**: assumes $\psi = \text{informative}$, only infers world complexity
+- **Vigilant**: jointly infers world complexity and speaker type $\psi \in \{\text{informative}, \text{persuade-up}, \text{persuade-down}, \text{unreliable}\}$
 
 Speaker types:
 
-- **Informative** ($\psi = \text{inf}$): minimizes information loss $P(u|w,c) \propto \exp[-\alpha \cdot \text{KL}(P_\text{true} \| P_\text{compressed})]$
-- **Persuade-up** ($\psi = \text{pers+}$): inflates outcome belief $P(u|w,c) \propto \exp[\alpha \cdot E[Y{=}1|u,c]]$
-- **Persuade-down** ($\psi = \text{pers-}$): deflates outcome belief $P(u|w,c) \propto \exp[\alpha \cdot E[Y{=}0|u,c]]$
+| Type | Utility | World-dependent? |
+|------|---------|-----------------|
+| Informative | $-\text{KL}(P_\text{true} \| P_\text{compressed})$ | Yes |
+| Persuade-up | $E[Y{=}1 \mid u, c]$ | No |
+| Persuade-down | $E[Y{=}0 \mid u, c]$ | No |
+| Unreliable | uniform random | No |
 
 ```{python}
 scenario = build_trust_update_scenario()
+world_dags = {'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']}
+prior_range = np.linspace(0.05, 0.95, 40)
 
-rsa_model = RSATrustModel(
-    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
-    utterances=scenario['utterances'],
-    effect_var=scenario['effect_var'],
-    prior_world={'simple': 0.5, 'complex': 0.5},
-    speaker_alpha=10.0,
-    contexts=scenario['contexts'],
-)
-
-print("Derived likelihoods P(u | world, goal, context):")
-for ctx_label, ctx in [("G=0", {'G': 0}), ("G=1", {'G': 1})]:
-    for utt in scenario['utterances']:
-        lk = rsa_model.get_derived_likelihoods(ctx, utt.name)
-        print(f"\n  P({utt.name} | context={ctx_label}):")
-        for (w, g), p in sorted(lk.items()):
-            print(f"    {w:>8s}, {g:>14s}: {p:.4f}")
-```
-
-### Revision signals (complex, informative)
-
-When the speaker revises advice across contexts ("drug works" for G=1, then "drug doesn't work" for G=0), this is strong evidence the speaker is informative and the world is complex. No other (world, goal) combination predicts this pattern.
-
-```{python}
 revision_obs = [
     ({'G': 1}, 'drug_works'),
     ({'G': 0}, 'drug_doesnt_work'),
 ]
-
-rsa_50 = RSATrustModel(
-    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
-    utterances=scenario['utterances'],
-    effect_var='Y',
-    prior_world={'simple': 0.5, 'complex': 0.5},
-    speaker_alpha=10.0,
-    contexts=scenario['contexts'],
-)
-result_rev = rsa_50.update(revision_obs)
-
-print("After observing revision (drug_works -> drug_doesnt_work):")
-print(f"  Trust (P(informative)): {result_rev['prior_reliable']:.3f} -> {result_rev['posterior_reliable']:.3f} (delta={result_rev['trust_delta']:+.3f})")
-print(f"  Complexity: {result_rev['prior_complex']:.3f} -> {result_rev['posterior_complex']:.3f} (delta={result_rev['complexity_delta']:+.3f})")
-print(f"\n  Joint beliefs:")
-for (w, g), p in sorted(rsa_50.get_beliefs().items()):
-    print(f"    {w:>8s}, {g:>14s}: {p:.4f}")
-```
-
-### Consistency is ambiguous
-
-Consistent advice ("drug works" in both contexts) is compatible with (simple, informative) or (any world, persuade-up). Whether it increases or decreases trust depends on the listener's complexity prior.
-
-```{python}
 consistent_obs = [
     ({'G': 1}, 'drug_works'),
     ({'G': 0}, 'drug_works'),
 ]
 
-# Simple believer
-rsa_simple = RSATrustModel(
-    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
-    utterances=scenario['utterances'],
-    effect_var='Y',
-    prior_world={'simple': 0.9, 'complex': 0.1},
-    speaker_alpha=10.0,
-    contexts=scenario['contexts'],
-)
-r_simple = rsa_simple.update(consistent_obs)
-
-# Complex believer
-rsa_complex = RSATrustModel(
-    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
-    utterances=scenario['utterances'],
-    effect_var='Y',
-    prior_world={'simple': 0.1, 'complex': 0.9},
-    speaker_alpha=10.0,
-    contexts=scenario['contexts'],
-)
-r_complex = rsa_complex.update(consistent_obs)
-
-print("After consistent advice (drug_works in both contexts):")
-print(f"\nSimple believer (P(complex)=0.1):")
-print(f"  Trust: {r_simple['prior_reliable']:.3f} -> {r_simple['posterior_reliable']:.3f} (delta={r_simple['trust_delta']:+.3f})")
-print(f"\nComplex believer (P(complex)=0.9):")
-print(f"  Trust: {r_complex['prior_reliable']:.3f} -> {r_complex['posterior_reliable']:.3f} (delta={r_complex['trust_delta']:+.3f})")
+credulous_goal = {'informative': 1.0, 'persuade_up': 0.0, 'persuade_down': 0.0, 'unreliable': 0.0}
+vigilant_goal = None  # uses default uniform prior over all 4 types
 ```
 
-## Trust Crossover: Consistent Advice
+### Derived speaker likelihoods
 
-Sweeping P(C=complex) from 0 to 1 with consistent observations reveals the crossover. Listeners who believe the world is simple trust consistent advice (the speaker is reporting the simple truth). Listeners who believe the world is complex distrust it (an informative speaker would have revised).
+Informative likelihoods are world-dependent; persuasive and unreliable likelihoods are not. Revision can only be explained by an informative speaker in a complex world.
 
 ```{python}
-prior_range = np.linspace(0.05, 0.95, 40)
-
-trust_consistent = compute_trust_curve(
-    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+rsa_model = RSATrustModel(
+    world_dags=world_dags,
     utterances=scenario['utterances'],
     effect_var='Y',
-    observations=consistent_obs,
-    prior_complex_range=prior_range,
+    prior_world={'simple': 0.5, 'complex': 0.5},
     speaker_alpha=10.0,
     contexts=scenario['contexts'],
 )
 
-trust_revision = compute_trust_curve(
-    world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
-    utterances=scenario['utterances'],
-    effect_var='Y',
-    observations=revision_obs,
-    prior_complex_range=prior_range,
-    speaker_alpha=10.0,
-    contexts=scenario['contexts'],
-)
+print("P(u | world, goal, context):")
+for ctx_label, ctx in [("G=0", {'G': 0}), ("G=1", {'G': 1})]:
+    for utt in scenario['utterances']:
+        lk = rsa_model.get_derived_likelihoods(ctx, utt.name)
+        print(f"\n  P({utt.name} | {ctx_label}):")
+        for (w, g), p in sorted(lk.items()):
+            print(f"    {w:>8s}, {g:>14s}: {p:.4f}")
 ```
 
+### Point comparison at flat prior
+
 ```{python}
-#| fig-cap: "Trust delta vs complexity prior for consistent and revision observations"
+def run_both_listeners(obs):
+    results = {}
+    for label, goal in [('Credulous', credulous_goal), ('Vigilant', vigilant_goal)]:
+        m = RSATrustModel(
+            world_dags=world_dags,
+            utterances=scenario['utterances'],
+            effect_var='Y',
+            prior_world={'simple': 0.5, 'complex': 0.5},
+            prior_goal=goal,
+            speaker_alpha=10.0,
+            contexts=scenario['contexts'],
+        )
+        results[label] = m.update(obs)
+    return results
+
+for obs_label, obs in [('REVISION', revision_obs), ('CONSISTENT', consistent_obs)]:
+    print(f"\n{obs_label}:")
+    results = run_both_listeners(obs)
+    for label, r in results.items():
+        trust_str = f"P(inf): {r['posterior_reliable']:.3f}" if label == 'Vigilant' else "P(inf): 1.000"
+        print(f"  {label:10s}  P(complex): {r['posterior_complex']:.3f}   {trust_str}")
+```
+
+### Vigilance attenuates world inference
+
+```{python}
+#| fig-cap: "Credulous vs vigilant: world inference and trust"
+#| label: fig-credulous-vs-vigilant
+
+def sweep_listener(obs, prior_goal):
+    complexity_deltas, trust_deltas = [], []
+    for p in prior_range:
+        m = RSATrustModel(
+            world_dags=world_dags,
+            utterances=scenario['utterances'],
+            effect_var='Y',
+            prior_world={'simple': 1-p, 'complex': float(p)},
+            prior_goal=prior_goal,
+            speaker_alpha=10.0,
+            contexts=scenario['contexts'],
+        )
+        r = m.update(obs)
+        complexity_deltas.append(r['complexity_delta'])
+        trust_deltas.append(r['trust_delta'])
+    return np.array(complexity_deltas), np.array(trust_deltas)
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+# Panel 1: Complexity delta — revision
+ax = axes[0]
+cd_cred_rev, _ = sweep_listener(revision_obs, credulous_goal)
+cd_vig_rev, _ = sweep_listener(revision_obs, vigilant_goal)
+ax.plot(prior_range, cd_cred_rev, 'r-', linewidth=2, label='Credulous')
+ax.plot(prior_range, cd_vig_rev, 'r--', linewidth=2, label='Vigilant')
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+ax.set_xlabel('P(complex) prior')
+ax.set_ylabel(r'$\Delta$ P(complex)')
+ax.set_title('World Inference: Revision')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Panel 2: Complexity delta — consistent
+ax = axes[1]
+cd_cred_con, _ = sweep_listener(consistent_obs, credulous_goal)
+cd_vig_con, _ = sweep_listener(consistent_obs, vigilant_goal)
+ax.plot(prior_range, cd_cred_con, 'b-', linewidth=2, label='Credulous')
+ax.plot(prior_range, cd_vig_con, 'b--', linewidth=2, label='Vigilant')
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+ax.set_xlabel('P(complex) prior')
+ax.set_ylabel(r'$\Delta$ P(complex)')
+ax.set_title('World Inference: Consistent')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Panel 3: Trust delta — vigilant only
+ax = axes[2]
+_, td_vig_rev = sweep_listener(revision_obs, vigilant_goal)
+_, td_vig_con = sweep_listener(consistent_obs, vigilant_goal)
+ax.plot(prior_range, td_vig_rev, 'r--', linewidth=2, label='Revision')
+ax.plot(prior_range, td_vig_con, 'b--', linewidth=2, label='Consistent')
+ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
+ax.set_xlabel('P(complex) prior')
+ax.set_ylabel(r'$\Delta$ P(informative)')
+ax.set_title('Trust: Vigilant Only')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+```
+
+## Trust Crossover
+
+Whether advice helps or hurts trust depends on the complexity prior. Both observation types cross zero, but at different thresholds.
+
+```{python}
+#| fig-cap: "Trust crossover for the vigilant listener"
 #| label: fig-trust-crossover
 
 fig, ax = plt.subplots(figsize=(8, 5))
 
-pc = trust_consistent['prior_complex']
-td_cons = trust_consistent['trust_delta']
-td_rev = trust_revision['trust_delta']
-
-ax.plot(pc, td_cons, 'b-', linewidth=2, label='Consistent advice')
-ax.plot(pc, td_rev, 'r--', linewidth=2, label='Revision')
+ax.plot(prior_range, td_vig_con, 'b-', linewidth=2.5, label='Consistent')
+ax.plot(prior_range, td_vig_rev, 'r--', linewidth=2.5, label='Revision')
 ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
 
-# Find and annotate crossover for consistent
-sign_changes = np.where(np.diff(np.sign(td_cons)))[0]
-if len(sign_changes) > 0:
-    idx = sign_changes[0]
-    x0, x1 = pc[idx], pc[idx + 1]
-    y0, y1 = td_cons[idx], td_cons[idx + 1]
-    crossover = x0 - y0 * (x1 - x0) / (y1 - y0)
-    ax.plot(crossover, 0, 'bo', markersize=10)
-    ax.annotate(
-        f'crossover: P(complex)={crossover:.2f}',
-        xy=(crossover, 0),
-        xytext=(crossover + 0.12, -0.08),
-        arrowprops=dict(arrowstyle='->', color='blue'),
-        fontsize=10, color='blue',
-    )
+for td, color, label in [(td_vig_con, 'blue', 'consistent'),
+                          (td_vig_rev, 'red', 'revision')]:
+    sign_changes = np.where(np.diff(np.sign(td)))[0]
+    if len(sign_changes) > 0:
+        idx = sign_changes[0]
+        x0, x1 = prior_range[idx], prior_range[idx + 1]
+        y0, y1 = td[idx], td[idx + 1]
+        crossover = x0 - y0 * (x1 - x0) / (y1 - y0)
+        ax.plot(crossover, 0, 'o', color=color, markersize=9)
+        offset_y = 0.06 if label == 'revision' else -0.08
+        ax.annotate(
+            f'{label}: {crossover:.2f}',
+            xy=(crossover, 0),
+            xytext=(crossover + 0.08, offset_y),
+            arrowprops=dict(arrowstyle='->', color=color),
+            fontsize=10, color=color,
+        )
 
-ax.set_xlabel('P(world = complex)', fontsize=12)
-ax.set_ylabel(r'$\Delta$ P(speaker = informative)', fontsize=12)
-ax.set_title('Trust Updates: Consistent vs Revision', fontsize=14)
-ax.legend(fontsize=11)
+ax.set_xlabel('P(world = complex)')
+ax.set_ylabel(r'$\Delta$ P(speaker = informative)')
+ax.set_title('When Does Compression Backfire?')
+ax.legend()
 ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
@@ -337,7 +344,7 @@ plt.show()
 
 ## Effect of Explanation
 
-When the speaker provides an explanation (shifting the listener's prior toward "complex world"), the trust dynamics change. For consistent advice, explanation makes the listener more suspicious (they now expect revision). For revision, explanation reinforces the informative interpretation.
+Explanation shifts the listener's complexity prior upward before observing advice. For consistent advice this increases suspicion; for revision it reinforces the informative interpretation.
 
 ```{python}
 #| fig-cap: "Explanation shifts trust curves"
@@ -345,15 +352,15 @@ When the speaker provides an explanation (shifting the listener's prior toward "
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-for ax, obs, title in [(axes[0], consistent_obs, 'Consistent Advice'),
+for ax, obs, title in [(axes[0], consistent_obs, 'Consistent'),
                         (axes[1], revision_obs, 'Revision')]:
     for strength, color, label in [(0, 'blue', 'No explanation'),
-                                    (1.0, 'orange', 'Moderate explanation'),
-                                    (2.0, 'green', 'Strong explanation')]:
+                                    (1.0, 'orange', 'Moderate'),
+                                    (2.0, 'green', 'Strong')]:
         deltas = []
         for p_complex in prior_range:
             m = RSATrustModel(
-                world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+                world_dags=world_dags,
                 utterances=scenario['utterances'],
                 effect_var='Y',
                 prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
@@ -369,10 +376,10 @@ for ax, obs, title in [(axes[0], consistent_obs, 'Consistent Advice'),
         ax.plot(prior_range, deltas, color=color, linewidth=2, label=label)
 
     ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-    ax.set_xlabel('P(world = complex)', fontsize=12)
-    ax.set_ylabel(r'$\Delta$ P(informative)', fontsize=12)
-    ax.set_title(title, fontsize=14)
-    ax.legend(fontsize=10)
+    ax.set_xlabel('P(world = complex)')
+    ax.set_ylabel(r'$\Delta$ P(informative)')
+    ax.set_title(title)
+    ax.legend()
     ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
@@ -381,22 +388,20 @@ plt.show()
 
 ## Speaker Goal Inference
 
-The model also infers the speaker's goal. After revision, the listener shifts strongly toward $\psi = \text{informative}$. After consistent positive advice, the listener sees a mixture of informative and persuade-up.
+The vigilant listener also infers *why* the speaker said what they said.
 
 ```{python}
-#| fig-cap: "Goal inference after different observation patterns"
+#| fig-cap: "Goal inference after revision vs consistent advice"
 #| label: fig-goal-inference
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
 for ax, obs, title in [(axes[0], revision_obs, 'After Revision'),
                         (axes[1], consistent_obs, 'After Consistent')]:
-    inf_beliefs = []
-    up_beliefs = []
-    down_beliefs = []
+    goal_traces = {g: [] for g in ['informative', 'persuade_up', 'persuade_down', 'unreliable']}
     for p_complex in prior_range:
         m = RSATrustModel(
-            world_dags={'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']},
+            world_dags=world_dags,
             utterances=scenario['utterances'],
             effect_var='Y',
             prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
@@ -405,18 +410,18 @@ for ax, obs, title in [(axes[0], revision_obs, 'After Revision'),
         )
         m.update(obs)
         goals = m.get_goal_beliefs()
-        inf_beliefs.append(goals['informative'])
-        up_beliefs.append(goals['persuade_up'])
-        down_beliefs.append(goals['persuade_down'])
+        for g in goal_traces:
+            goal_traces[g].append(goals[g])
 
-    ax.plot(prior_range, inf_beliefs, 'b-', linewidth=2, label='Informative')
-    ax.plot(prior_range, up_beliefs, 'r-', linewidth=2, label='Persuade-up')
-    ax.plot(prior_range, down_beliefs, 'g-', linewidth=2, label='Persuade-down')
-    ax.axhline(y=1/3, color='gray', linestyle='--', alpha=0.5, label='Prior')
-    ax.set_xlabel('P(world = complex)', fontsize=12)
-    ax.set_ylabel('P(goal type)', fontsize=12)
-    ax.set_title(title, fontsize=14)
-    ax.legend(fontsize=10)
+    ax.plot(prior_range, goal_traces['informative'], 'b-', linewidth=2, label='Informative')
+    ax.plot(prior_range, goal_traces['persuade_up'], 'r-', linewidth=2, label='Persuade-up')
+    ax.plot(prior_range, goal_traces['persuade_down'], 'g-', linewidth=2, label='Persuade-down')
+    ax.plot(prior_range, goal_traces['unreliable'], 'k:', linewidth=2, label='Unreliable')
+    ax.axhline(y=1/4, color='gray', linestyle='--', alpha=0.5, label='Prior')
+    ax.set_xlabel('P(world = complex)')
+    ax.set_ylabel('P(goal type)')
+    ax.set_title(title)
+    ax.legend(fontsize=9)
     ax.set_ylim(-0.05, 1.05)
     ax.grid(True, alpha=0.3)
 
