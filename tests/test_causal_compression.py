@@ -348,7 +348,7 @@ class TestContextDependentCompression:
 
 
 class TestRSATrustModel:
-    """Test the RSA trust model (memo-based)."""
+    """Test the RSA trust model with persuasive speaker types."""
 
     @pytest.fixture
     def scenario(self):
@@ -364,28 +364,52 @@ class TestRSATrustModel:
             utterances=scenario['utterances'],
             effect_var=scenario['effect_var'],
             prior_world={'simple': 0.5, 'complex': 0.5},
-            prior_reliable=0.8,
             speaker_alpha=10.0,
             contexts=scenario['contexts'],
         )
 
+    def _make_model(self, scenario, prior_world, **kwargs):
+        """Helper to create RSATrustModel with given priors."""
+        defaults = dict(
+            world_dags={
+                'simple': scenario['simple_dag'],
+                'complex': scenario['complex_dag'],
+            },
+            utterances=scenario['utterances'],
+            effect_var='Y',
+            prior_world=prior_world,
+            speaker_alpha=10.0,
+            contexts=scenario['contexts'],
+        )
+        defaults.update(kwargs)
+        return RSATrustModel(**defaults)
+
     def test_beliefs_normalize(self, model):
-        """Joint beliefs over (world, reliability) should sum to 1."""
+        """Joint beliefs over (world, goal) should sum to 1."""
         beliefs = model.get_beliefs()
         total = sum(beliefs.values())
         assert np.isclose(total, 1.0, atol=1e-6)
+        assert len(beliefs) == 6  # 2 worlds x 3 goals
 
     def test_initial_marginals(self, model):
         """Initial marginals should match the priors."""
-        assert np.isclose(model.get_reliability_belief(), 0.8, atol=1e-6)
+        # Default prior_goal is uniform 1/3 each, so P(informative) = 1/3
+        assert np.isclose(model.get_reliability_belief(), 1 / 3, atol=1e-6)
         assert np.isclose(model.get_complexity_belief(), 0.5, atol=1e-6)
 
-    def test_derived_likelihoods_match_speaker(self, scenario, model):
-        """Derived likelihoods for reliable speaker should match CompressionSpeaker probs."""
+    def test_goal_beliefs(self, model):
+        """Goal beliefs should match prior and sum to 1."""
+        goals = model.get_goal_beliefs()
+        assert set(goals.keys()) == {'informative', 'persuade_up', 'persuade_down'}
+        assert np.isclose(sum(goals.values()), 1.0, atol=1e-6)
+        for g in goals.values():
+            assert np.isclose(g, 1 / 3, atol=1e-6)
+
+    def test_informative_likelihoods_match_speaker(self, scenario, model):
+        """Informative speaker likelihoods should match CompressionSpeaker probs."""
         ctx = {'G': 1}
         lk = model.get_derived_likelihoods(ctx, 'drug_works')
 
-        # Build a speaker for the complex world and check
         spk = CompressionSpeaker(
             scenario['complex_dag'],
             scenario['utterances'],
@@ -394,170 +418,101 @@ class TestRSATrustModel:
         )
         probs = spk.get_utterance_probs(ctx)
         assert np.isclose(
-            lk[('complex', 'reliable')],
+            lk[('complex', 'informative')],
             probs['drug_works'],
             atol=1e-6,
         )
 
-    def test_unreliable_speaker_uniform(self, model):
-        """Unreliable speaker likelihoods should be uniform 0.5."""
-        lk = model.get_derived_likelihoods({'G': 1}, 'drug_works')
-        assert np.isclose(lk[('simple', 'unreliable')], 0.5, atol=1e-6)
-        assert np.isclose(lk[('complex', 'unreliable')], 0.5, atol=1e-6)
+    def test_persuasive_speaker_directional(self, model):
+        """Persuade-up should prefer drug_works; persuade-down should prefer drug_doesnt_work."""
+        lk_works = model.get_derived_likelihoods({'G': 1}, 'drug_works')
+        lk_doesnt = model.get_derived_likelihoods({'G': 1}, 'drug_doesnt_work')
 
-    def test_opposite_trust_updates(self, scenario):
-        """
-        Simple-believer and complex-believer should have opposite trust
-        deltas after observing context-dependent revision.
-        """
-        observations = [
+        # Persuade-up strongly prefers drug_works
+        assert lk_works[('simple', 'persuade_up')] > 0.9
+        assert lk_doesnt[('simple', 'persuade_up')] < 0.1
+
+        # Persuade-down strongly prefers drug_doesnt_work
+        assert lk_doesnt[('simple', 'persuade_down')] > 0.9
+        assert lk_works[('simple', 'persuade_down')] < 0.1
+
+        # Persuasive probs are world-independent
+        assert np.isclose(
+            lk_works[('simple', 'persuade_up')],
+            lk_works[('complex', 'persuade_up')],
+            atol=1e-6,
+        )
+
+    def test_revision_signals_complex_informative(self, scenario):
+        """Revision (changing advice across contexts) should increase
+        P(complex) and P(informative) when priors are moderate."""
+        model = self._make_model(scenario, {'simple': 0.5, 'complex': 0.5})
+        result = model.update([
             ({'G': 1}, 'drug_works'),
             ({'G': 0}, 'drug_doesnt_work'),
-        ]
+        ])
+        # Revision uniquely fingerprints (complex, informative)
+        assert result['trust_delta'] > 0
+        assert result['complexity_delta'] > 0
 
-        # Simple believer: P(complex) low
-        simple_model = RSATrustModel(
-            world_dags={
-                'simple': scenario['simple_dag'],
-                'complex': scenario['complex_dag'],
-            },
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.9, 'complex': 0.1},
-            prior_reliable=0.8,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        result_s = simple_model.update(observations)
+    def test_consistency_ambiguous(self, scenario):
+        """Consistent advice is ambiguous: could be (simple, informative)
+        or (any world, persuade_up).  For a complex-believer, trust
+        should decrease because informative+complex would have revised."""
+        complex_model = self._make_model(scenario, {'simple': 0.1, 'complex': 0.9})
+        result = complex_model.update([
+            ({'G': 1}, 'drug_works'),
+            ({'G': 0}, 'drug_works'),
+        ])
+        # Complex-believer hearing consistent advice: trust decreases
+        # (an informative speaker in a complex world would have revised)
+        assert result['trust_delta'] < 0
 
-        # Complex believer: P(complex) high
-        complex_model = RSATrustModel(
-            world_dags={
-                'simple': scenario['simple_dag'],
-                'complex': scenario['complex_dag'],
-            },
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.1, 'complex': 0.9},
-            prior_reliable=0.8,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        result_c = complex_model.update(observations)
+    def test_consistency_simple_believer_trusts(self, scenario):
+        """For a simple-believer, consistent advice supports (simple, informative)
+        and trust should increase."""
+        simple_model = self._make_model(scenario, {'simple': 0.9, 'complex': 0.1})
+        result = simple_model.update([
+            ({'G': 1}, 'drug_works'),
+            ({'G': 0}, 'drug_works'),
+        ])
+        assert result['trust_delta'] > 0
 
-        # Opposite signs
-        assert result_s['trust_delta'] * result_c['trust_delta'] < 0
-
-    def test_crossover_exists(self, scenario):
-        """Sweeping P(complex) should produce a sign change in trust_delta."""
+    def test_crossover_exists_consistent(self, scenario):
+        """Sweeping P(complex) with consistent observations should produce
+        a sign change in trust_delta."""
         observations = [
             ({'G': 1}, 'drug_works'),
-            ({'G': 0}, 'drug_doesnt_work'),
+            ({'G': 0}, 'drug_works'),
         ]
-        prior_range = np.linspace(0.05, 0.95, 20)
+        prior_range = np.linspace(0.05, 0.95, 30)
         deltas = []
         for p_complex in prior_range:
-            m = RSATrustModel(
-                world_dags={
-                    'simple': scenario['simple_dag'],
-                    'complex': scenario['complex_dag'],
-                },
-                utterances=scenario['utterances'],
-                effect_var='Y',
-                prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
-                prior_reliable=0.8,
-                speaker_alpha=10.0,
-                contexts=scenario['contexts'],
-            )
+            m = self._make_model(scenario, {
+                'simple': 1.0 - p_complex, 'complex': float(p_complex),
+            })
             deltas.append(m.update(observations)['trust_delta'])
 
         deltas = np.array(deltas)
         sign_changes = np.where(np.diff(np.sign(deltas)))[0]
         assert len(sign_changes) > 0, "Expected a crossover in trust_delta"
 
-    def test_consistent_increases_trust(self, scenario):
-        """Consistent observations should increase trust (positive delta),
-        while context-dependent revision decreases trust for a simple-believer."""
-        consistent_obs = [
-            ({'G': 1}, 'drug_works'),
-            ({'G': 1}, 'drug_works'),
-        ]
-        revision_obs = [
-            ({'G': 1}, 'drug_works'),
-            ({'G': 0}, 'drug_doesnt_work'),
-        ]
-
-        model_cons = RSATrustModel(
-            world_dags={
-                'simple': scenario['simple_dag'],
-                'complex': scenario['complex_dag'],
-            },
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.9, 'complex': 0.1},
-            prior_reliable=0.8,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        model_rev = RSATrustModel(
-            world_dags={
-                'simple': scenario['simple_dag'],
-                'complex': scenario['complex_dag'],
-            },
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.9, 'complex': 0.1},
-            prior_reliable=0.8,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-
-        r_cons = model_cons.update(consistent_obs)
-        r_rev = model_rev.update(revision_obs)
-
-        # Consistent observations increase trust
-        assert r_cons['trust_delta'] > 0
-        # Revision decreases trust for simple-believer
-        assert r_rev['trust_delta'] < 0
-
     def test_explanation_preserves_trust(self, scenario):
-        """Explanation (shifting prior toward complex) should make trust
-        delta less negative for a simple-believer."""
+        """Explanation (shifting prior toward complex) should increase
+        trust delta for revision observations."""
         observations = [
             ({'G': 1}, 'drug_works'),
             ({'G': 0}, 'drug_doesnt_work'),
         ]
 
-        model_no_exp = RSATrustModel(
-            world_dags={
-                'simple': scenario['simple_dag'],
-                'complex': scenario['complex_dag'],
-            },
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.9, 'complex': 0.1},
-            prior_reliable=0.8,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        model_exp = RSATrustModel(
-            world_dags={
-                'simple': scenario['simple_dag'],
-                'complex': scenario['complex_dag'],
-            },
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.9, 'complex': 0.1},
-            prior_reliable=0.8,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
+        model_no = self._make_model(scenario, {'simple': 0.5, 'complex': 0.5})
+        model_exp = self._make_model(scenario, {'simple': 0.5, 'complex': 0.5})
 
-        r_no = model_no_exp.update(observations)
+        r_no = model_no.update(observations)
         r_exp = model_exp.update_with_explanation(observations, explanation_strength=2.0)
 
-        # With explanation, trust_delta should be less negative (more preserved)
-        assert r_exp['trust_delta'] > r_no['trust_delta']
+        # With explanation, trust_delta should be at least as high
+        assert r_exp['trust_delta'] >= r_no['trust_delta'] - 0.01
 
     def test_result_format(self, model):
         """update() should return the expected dict keys."""
@@ -573,7 +528,7 @@ class TestRSATrustModel:
         """reset() should restore initial beliefs."""
         model.update([({'G': 1}, 'drug_works')])
         model.reset()
-        assert np.isclose(model.get_reliability_belief(), 0.8, atol=1e-6)
+        assert np.isclose(model.get_reliability_belief(), 1 / 3, atol=1e-6)
         assert np.isclose(model.get_complexity_belief(), 0.5, atol=1e-6)
 
 

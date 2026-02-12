@@ -94,7 +94,7 @@ def compute_trust_curve(
     effect_var: str,
     observations: List[tuple],
     prior_complex_range: np.ndarray,
-    prior_reliable: float = 0.8,
+    prior_goal: Optional[Dict[str, float]] = None,
     speaker_alpha: float = 10.0,
     contexts: List[Dict[str, int]] = None,
 ) -> Dict[str, np.ndarray]:
@@ -109,7 +109,7 @@ def compute_trust_curve(
         effect_var: Outcome variable name
         observations: List of (context_dict, utterance_name) pairs
         prior_complex_range: Array of P(C=complex) values to sweep
-        prior_reliable: Prior P(speaker = reliable)
+        prior_goal: Prior over speaker goals (default: uniform over 3 types)
         speaker_alpha: Rationality parameter
         contexts: List of context dicts for speaker table precomputation
 
@@ -127,7 +127,7 @@ def compute_trust_curve(
             utterances=utterances,
             effect_var=effect_var,
             prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
-            prior_reliable=prior_reliable,
+            prior_goal=prior_goal,
             speaker_alpha=speaker_alpha,
             contexts=contexts,
         )

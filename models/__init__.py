@@ -31,7 +31,7 @@ from .speaker import Utterance, CompressionSpeaker
 from .listener import CompressionListener, TrustModel
 
 # RSA trust model (requires memo-lang + jax)
-from .rsa import RSATrustModel
+from .rsa import RSATrustModel, Goal
 
 # Analysis tools
 from .analysis import (
@@ -66,6 +66,7 @@ __all__ = [
     'CompressionListener',
     'TrustModel',
     'RSATrustModel',
+    'Goal',
     # Analysis
     'compute_rate_distortion_curve',
     'compute_trust_curve',

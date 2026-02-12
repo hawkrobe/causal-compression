@@ -4,12 +4,14 @@ from memo import memo
 from enum import IntEnum
 from typing import Dict, List, Tuple
 
+from scipy.special import softmax as scipy_softmax
+
 from .dag import CausalDAG
 from .speaker import Utterance, CompressionSpeaker
 
 
 # ---------------------------------------------------------------------------
-# Domains  (IntEnum, following Hannah's rsa_memo.py pattern)
+# Domains  (IntEnum, following the memo pattern)
 # ---------------------------------------------------------------------------
 
 class Utt(IntEnum):
@@ -18,16 +20,38 @@ class Utt(IntEnum):
     U1 = 1
 
 
-class WR(IntEnum):
-    """Joint state: (world_type, reliability) packed into a single index.
-       w: 0 = simple, 1 = complex
-       r: 0 = reliable, 1 = unreliable
-       Packing: s = w * 2 + r  ->  w = s // 2,  r = s % 2
+class Goal(IntEnum):
+    """Speaker goal types following the persuasive RSA pattern.
+
+    - INFORMATIVE: minimize information loss (standard RSA)
+    - PERSUADE_UP: maximize listener's belief that outcome Y=1
+    - PERSUADE_DOWN: maximize listener's belief that outcome Y=0
     """
-    SIMPLE_RELIABLE = 0
-    SIMPLE_UNRELIABLE = 1
-    COMPLEX_RELIABLE = 2
-    COMPLEX_UNRELIABLE = 3
+    INFORMATIVE = 0
+    PERSUADE_UP = 1
+    PERSUADE_DOWN = 2
+
+
+N_GOALS = len(Goal)
+
+
+class WG(IntEnum):
+    """Joint state: (world_type, goal) packed into a single index.
+       w: 0 = simple, 1 = complex
+       g: 0 = informative, 1 = persuade_up, 2 = persuade_down
+       Packing: s = w * N_GOALS + g  ->  w = s // N_GOALS,  g = s % N_GOALS
+    """
+    SIMPLE_INFORMATIVE = 0
+    SIMPLE_PERSUADE_UP = 1
+    SIMPLE_PERSUADE_DOWN = 2
+    COMPLEX_INFORMATIVE = 3
+    COMPLEX_PERSUADE_UP = 4
+    COMPLEX_PERSUADE_DOWN = 5
+
+
+N_STATES = len(WG)
+
+GOAL_NAMES = ['informative', 'persuade_up', 'persuade_down']
 
 
 # ---------------------------------------------------------------------------
@@ -40,14 +64,11 @@ def _get_prior(s, prior):
 
 
 def _speaker_wpp(u, s, c, speaker_table):
-    """P(u | state=(w,r), context=c).
+    """P(u | state=(w,g), context=c).
 
-    Reliable speaker (r=0): probability from precomputed CompressionSpeaker table.
-    Unreliable speaker (r=1): uniform 1/|U| = 0.5.
+    speaker_table has shape [N_STATES, n_ctx, n_utt].
     """
-    w = s // 2
-    r = s % 2
-    return jnp.where(r == 0, speaker_table[w, c, u], 0.5)
+    return speaker_table[s, c, u]
 
 
 # ---------------------------------------------------------------------------
@@ -55,35 +76,82 @@ def _speaker_wpp(u, s, c, speaker_table):
 # ---------------------------------------------------------------------------
 
 @memo
-def rsa_trust[s: WR, u: Utt](prior: ..., speaker_table: ..., c):
-    """RSA listener: infer joint (world, reliability) from observed utterance.
+def rsa_trust[s: WG, u: Utt](prior: ..., speaker_table: ..., c):
+    """RSA listener: infer joint (world, goal) from observed utterance.
 
-    Returns |WR| x |Utt| array where [s, u] = P(state=s | observed u, context c).
+    Implements the vigilant listener from the persuasive RSA framework:
+        P_L1(w, psi | u) proportional to P(w) * P(psi) * P_S1(u | w, psi, c)
+
+    where psi in {informative, persuade_up, persuade_down}.
+
+    Returns |WG| x |Utt| array where [s, u] = P(state=s | observed u, context c).
     """
     listener: thinks[
-        speaker: given(s in WR, wpp=_get_prior(s, prior)),
+        speaker: given(s in WG, wpp=_get_prior(s, prior)),
         speaker: chooses(u in Utt, wpp=_speaker_wpp(u, s, c, speaker_table)),
     ]
     listener: observes [speaker.u] is u
-    listener: chooses(s in WR, wpp=Pr[speaker.s == s])
+    listener: chooses(s in WG, wpp=Pr[speaker.s == s])
     return Pr[listener.s == s]
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+def _compute_expected_outcome(dag: CausalDAG, effect_var: str,
+                              context: Dict[str, int]) -> float:
+    """Compute P(Y=1) under a DAG given context (as interventions).
+
+    Used for persuasive speaker utility:
+        V_pers+(u, c) = E[Y=1 | u's compressed DAG, c]
+    """
+    filtered = {k: v for k, v in context.items() if k in dag.variables}
+    joint = dag.compute_joint(interventions=filtered)
+    var_names = list(dag.variables.keys())
+    e_idx = var_names.index(effect_var)
+    return sum(prob for vals, prob in joint.items() if vals[e_idx] == 1)
+
+
+# ---------------------------------------------------------------------------
+# Default prior over speaker goals
+# ---------------------------------------------------------------------------
+
+DEFAULT_PRIOR_GOAL = {
+    'informative': 1 / 3,
+    'persuade_up': 1 / 3,
+    'persuade_down': 1 / 3,
+}
 
 
 # ---------------------------------------------------------------------------
 # RSATrustModel  wrapper
 # ---------------------------------------------------------------------------
 
-N_STATES = len(WR)
-
-
 class RSATrustModel:
-    """RSA-derived trust model.
+    """RSA-derived trust model with persuasive speaker types.
 
-    Likelihoods are computed from CompressionSpeaker (not hand-coded).
-    Inference is performed via the memo DSL, which compiles the RSA model
-    to JAX and handles Bayesian normalization automatically.
+    Extends the standard RSA framework to speakers with potentially
+    persuasive goals, following the persuasive RSA pattern:
 
-    Sequential observations are handled by feeding posteriors back as priors.
+        Speaker types (Eq. 1):
+        - Informative (psi=inf):  P(u|w,c) proportional to exp[-alpha * KL(P_true || P_compressed)]
+        - Persuade-up (psi=pers+): P(u|w,c) proportional to exp[alpha * E[Y=1|u,c]]
+        - Persuade-down (psi=pers-): P(u|w,c) proportional to exp[alpha * E[Y=0|u,c]]
+
+        Vigilant listener (Eq. 2):
+        P_L1(w, psi | u) proportional to P(w) * P(psi) * P_S1(u | w, psi, c)
+
+    The listener jointly infers:
+    - world complexity (simple vs complex causal structure)
+    - speaker goal (informative vs persuasive)
+
+    Key predictions:
+    - Revision (changing advice across contexts) strongly signals
+      (complex world, informative speaker).
+    - Consistency is ambiguous: could be (simple, informative) or
+      (any world, persuasive).  Whether consistent advice increases
+      or decreases trust depends on the complexity prior.
     """
 
     def __init__(
@@ -92,7 +160,7 @@ class RSATrustModel:
         utterances: List[Utterance],
         effect_var: str,
         prior_world: Dict[str, float],
-        prior_reliable: float = 0.8,
+        prior_goal: Dict[str, float] = None,
         speaker_alpha: float = 10.0,
         contexts: List[Dict[str, int]] = None,
     ):
@@ -108,7 +176,7 @@ class RSATrustModel:
         self.utterances = utterances
         self.effect_var = effect_var
         self.prior_world = dict(prior_world)
-        self.prior_reliable = prior_reliable
+        self.prior_goal = dict(prior_goal or DEFAULT_PRIOR_GOAL)
         self.speaker_alpha = speaker_alpha
 
         self._world_names = list(world_dags.keys())
@@ -119,13 +187,14 @@ class RSATrustModel:
             tuple(sorted(c.items())): i for i, c in enumerate(contexts)
         }
 
-        # --- precompute speaker probability table [n_worlds, n_ctx, n_utt] ---
+        # --- precompute speaker probability table [N_STATES, n_ctx, n_utt] ---
         n_worlds = len(self._world_names)
         n_ctx = len(contexts)
         n_utt = len(utterances)
 
+        # Informative speaker: CompressionSpeaker (loss-based utility)
         self._speakers: Dict[str, CompressionSpeaker] = {}
-        speaker_table_np = np.zeros((n_worlds, n_ctx, n_utt))
+        informative_table = np.zeros((n_worlds, n_ctx, n_utt))
 
         for wi, wname in enumerate(self._world_names):
             dag = world_dags[wname]
@@ -135,18 +204,56 @@ class RSATrustModel:
                 filtered = {k: v for k, v in ctx.items() if k in dag.variables}
                 probs = spk.get_utterance_probs(filtered)
                 for ui, u in enumerate(utterances):
-                    speaker_table_np[wi, ci, ui] = probs[u.name]
+                    informative_table[wi, ci, ui] = probs[u.name]
+
+        # Persuasive speakers: utility = expected outcome under compressed DAG
+        #   V_pers+(u, c) = P(Y=1 | u's DAG, c)    (inflate outcome belief)
+        #   V_pers-(u, c) = P(Y=0 | u's DAG, c)    (deflate outcome belief)
+        # These don't depend on the true world — only on what the
+        # compressed DAG implies — matching the paper's formulation.
+        persuade_up_table = np.zeros((n_worlds, n_ctx, n_utt))
+        persuade_down_table = np.zeros((n_worlds, n_ctx, n_utt))
+
+        for ci, ctx in enumerate(contexts):
+            utils_up = np.zeros(n_utt)
+            utils_down = np.zeros(n_utt)
+            for ui, u in enumerate(utterances):
+                p_y1 = _compute_expected_outcome(u.abstracted_dag, effect_var, ctx)
+                utils_up[ui] = p_y1
+                utils_down[ui] = 1.0 - p_y1
+
+            probs_up = scipy_softmax(speaker_alpha * utils_up)
+            probs_down = scipy_softmax(speaker_alpha * utils_down)
+
+            # Same probabilities for all worlds (persuasive utility is
+            # world-independent — the speaker frames, not lies)
+            for wi in range(n_worlds):
+                persuade_up_table[wi, ci, :] = probs_up
+                persuade_down_table[wi, ci, :] = probs_down
+
+        # Pack into [N_STATES, n_ctx, n_utt]
+        # State packing: s = w * N_GOALS + g
+        speaker_table_np = np.zeros((N_STATES, n_ctx, n_utt))
+        for wi in range(n_worlds):
+            for gi in range(N_GOALS):
+                si = wi * N_GOALS + gi
+                if gi == Goal.INFORMATIVE:
+                    speaker_table_np[si] = informative_table[wi]
+                elif gi == Goal.PERSUADE_UP:
+                    speaker_table_np[si] = persuade_up_table[wi]
+                elif gi == Goal.PERSUADE_DOWN:
+                    speaker_table_np[si] = persuade_down_table[wi]
 
         self._speaker_table = jnp.array(speaker_table_np)
 
-        # --- build initial prior over WR states ---
+        # --- build initial prior over WG states ---
         prior_arr = np.zeros(N_STATES)
         for si in range(N_STATES):
-            w = si // 2
-            r = si % 2
+            w = si // N_GOALS
+            g = si % N_GOALS
             p_w = prior_world[self._world_names[w]]
-            p_r = prior_reliable if r == 0 else (1 - prior_reliable)
-            prior_arr[si] = p_w * p_r
+            p_g = self.prior_goal[GOAL_NAMES[g]]
+            prior_arr[si] = p_w * p_g
 
         self._initial_prior = jnp.array(prior_arr)
         self._current_prior = jnp.array(prior_arr)
@@ -171,10 +278,10 @@ class RSATrustModel:
         """Sequential Bayesian update via the memo RSA model.
 
         For each (context, utterance_name) observation:
-          1. Call rsa_trust to get P(w,r | u, c) for all u.
+          1. Call rsa_trust to get P(w,g | u, c) for all u.
           2. Extract the column for the observed u -> new prior.
 
-        Returns dict matching TrustModel.update() format.
+        Returns dict with trust and complexity deltas.
         """
         prior_reliable = self.get_reliability_belief()
         prior_complex = self.get_complexity_belief()
@@ -183,7 +290,7 @@ class RSATrustModel:
             c_idx = self._ctx_idx(ctx)
             u_idx = self._utt_idx(utt_name)
 
-            # rsa_trust returns shape [|WR|, |Utt|]
+            # rsa_trust returns shape [|WG|, |Utt|]
             posterior_table = rsa_trust(
                 prior=self._current_prior,
                 speaker_table=self._speaker_table,
@@ -214,9 +321,9 @@ class RSATrustModel:
         explanation_strength is in log-odds units: the complex-world
         hypotheses get exp(strength) more weight before normalising.
         """
-        # mask: 1 for complex states, 0 for simple
+        # mask: 1 for complex states (w=1), 0 for simple (w=0)
         complex_mask = jnp.array(
-            [1.0 if si // 2 == 1 else 0.0 for si in range(N_STATES)]
+            [1.0 if si // N_GOALS == 1 else 0.0 for si in range(N_STATES)]
         )
         log_prior = jnp.log(self._current_prior + 1e-20)
         log_prior = log_prior + complex_mask * explanation_strength
@@ -225,21 +332,32 @@ class RSATrustModel:
         return self.update(observations)
 
     def get_reliability_belief(self) -> float:
-        """P(speaker = reliable) marginal."""
+        """P(speaker = informative) marginal."""
         p = np.asarray(self._current_prior)
-        return float(sum(p[si] for si in range(N_STATES) if si % 2 == 0))
+        return float(sum(p[si] for si in range(N_STATES)
+                        if si % N_GOALS == Goal.INFORMATIVE))
 
     def get_complexity_belief(self) -> float:
         """P(world = complex) marginal."""
         p = np.asarray(self._current_prior)
-        return float(sum(p[si] for si in range(N_STATES) if si // 2 == 1))
+        return float(sum(p[si] for si in range(N_STATES)
+                        if si // N_GOALS == 1))
+
+    def get_goal_beliefs(self) -> Dict[str, float]:
+        """Marginal beliefs over speaker goals."""
+        p = np.asarray(self._current_prior)
+        return {
+            GOAL_NAMES[g]: float(sum(p[si] for si in range(N_STATES)
+                                     if si % N_GOALS == g))
+            for g in range(N_GOALS)
+        }
 
     def get_beliefs(self) -> Dict[Tuple[str, str], float]:
         """Full normalized joint belief table."""
         p = np.asarray(self._current_prior)
         return {
-            (self._world_names[si // 2],
-             'reliable' if si % 2 == 0 else 'unreliable'): float(p[si])
+            (self._world_names[si // N_GOALS],
+             GOAL_NAMES[si % N_GOALS]): float(p[si])
             for si in range(N_STATES)
         }
 
@@ -252,19 +370,14 @@ class RSATrustModel:
         context: Dict[str, int],
         utterance_name: str,
     ) -> Dict[Tuple[str, str], float]:
-        """Expose the computed likelihoods P(u | C, R, c) for comparison with
-        the hand-coded values in TrustModel.
-        """
+        """Expose the computed likelihoods P(u | w, g, c)."""
         c_idx = self._ctx_idx(context)
         u_idx = self._utt_idx(utterance_name)
         result = {}
         for si in range(N_STATES):
-            w = si // 2
-            r = si % 2
+            w = si // N_GOALS
+            g = si % N_GOALS
             wname = self._world_names[w]
-            rlabel = 'reliable' if r == 0 else 'unreliable'
-            if r == 0:
-                result[(wname, rlabel)] = float(self._speaker_table[w, c_idx, u_idx])
-            else:
-                result[(wname, rlabel)] = 1.0 / len(self.utterances)
+            glabel = GOAL_NAMES[g]
+            result[(wname, glabel)] = float(self._speaker_table[si, c_idx, u_idx])
         return result
