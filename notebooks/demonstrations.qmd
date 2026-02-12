@@ -1,19 +1,11 @@
 ---
-title: "Causal Compression Model Demonstrations"
+title: "Causal Compression Demonstrations"
 format:
   html:
     code-fold: false
     toc: true
 jupyter: python3
 ---
-
-This notebook demonstrates the key concepts from the causal compression framework for speaker-listener communication.
-
-## Key Predictions
-
-1. **Context-Dependent Compression**: The same true causal model produces different optimal utterances depending on context
-2. **Listener Trust Dynamics**: Same observation (advice revision) produces *opposite* trust updates depending on prior beliefs
-3. **Rate-Distortion Trade-off**: Speakers balance compression (rate) against accuracy (distortion)
 
 ```{python}
 import sys
@@ -30,33 +22,24 @@ from causal_compression import (
 )
 ```
 
-## 1. Context-Dependent Compression
+## Context-Dependent Compression
 
-**Scenario**: A doctor advises patients about a drug treatment.
-
-- The drug's effectiveness depends on a genetic marker (G)
-- G=1 (has marker): Drug is highly effective (90% success)
-- G=0 (no marker): Drug is ineffective (20% success)
-
-**Key prediction**: The same true DAG leads to different optimal utterances for different patients.
+A doctor advises patients about a drug treatment whose effectiveness depends on a genetic marker (G). G=1: drug is highly effective (90% success). G=0: drug is ineffective (20% success).
 
 ```{python}
-# Build the scenario
 true_dag, utterances = build_drug_marker_scenario()
 
-# Create speaker model
 speaker = CompressionSpeaker(
     true_dag=true_dag,
     utterances=utterances,
     effect_var='Y',
-    alpha=10.0  # Higher alpha = more rational/optimal
+    alpha=10.0
 )
 
-print("True DAG structure: G (genetic marker) -> Y <- D (drug)")
 print(f"Available utterances: {[u.name for u in utterances]}")
 ```
 
-### Context 1: Patient HAS the genetic marker
+### Patient has the genetic marker
 
 ```{python}
 context_marker = {'G': 1}
@@ -64,18 +47,17 @@ losses_marker = speaker.compute_losses(context_marker)
 probs_marker = speaker.get_utterance_probs(context_marker)
 optimal_marker = speaker.get_optimal_utterance(context_marker)
 
-print("Context: Patient HAS genetic marker (G=1)")
-print("=" * 50)
+print("Context: G=1")
 print("\nInformation losses (KL divergence):")
 for u, l in losses_marker.items():
     print(f"  {u}: {l:.4f} bits")
 print("\nUtterance probabilities:")
 for u, p in probs_marker.items():
     print(f"  {u}: {p:.4f}")
-print(f"\n-> Optimal utterance: '{optimal_marker.name}'")
+print(f"\nOptimal utterance: '{optimal_marker.name}'")
 ```
 
-### Context 2: Patient LACKS the genetic marker
+### Patient lacks the genetic marker
 
 ```{python}
 context_no_marker = {'G': 0}
@@ -83,26 +65,22 @@ losses_no_marker = speaker.compute_losses(context_no_marker)
 probs_no_marker = speaker.get_utterance_probs(context_no_marker)
 optimal_no_marker = speaker.get_optimal_utterance(context_no_marker)
 
-print("Context: Patient LACKS genetic marker (G=0)")
-print("=" * 50)
+print("Context: G=0")
 print("\nInformation losses (KL divergence):")
 for u, l in losses_no_marker.items():
     print(f"  {u}: {l:.4f} bits")
 print("\nUtterance probabilities:")
 for u, p in probs_no_marker.items():
     print(f"  {u}: {p:.4f}")
-print(f"\n-> Optimal utterance: '{optimal_no_marker.name}'")
+print(f"\nOptimal utterance: '{optimal_no_marker.name}'")
 ```
 
-### Visualization
-
 ```{python}
-#| fig-cap: "Context-dependent compression: same true DAG produces different optimal utterances"
+#| fig-cap: "Utterance probabilities and information loss by context"
 #| label: fig-context-compression
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-# Utterance probabilities for each context
 utterance_names = list(probs_marker.keys())
 x = np.arange(len(utterance_names))
 width = 0.35
@@ -119,7 +97,6 @@ ax.set_xticklabels(utterance_names, rotation=15)
 ax.legend()
 ax.grid(True, alpha=0.3)
 
-# Information loss for each context
 ax = axes[1]
 losses_marker_finite = {k: v if v < 10 else 10 for k, v in losses_marker.items()}
 losses_no_marker_finite = {k: v if v < 10 else 10 for k, v in losses_no_marker.items()}
@@ -139,74 +116,38 @@ plt.tight_layout()
 plt.show()
 ```
 
-::: {.callout-important}
-## Key Result: Context-Dependent Compression
+## Listener Trust Dynamics
 
-Same true DAG, but context changes optimal utterance!
-
-- **G=1 (has marker)**: Speaker says `{python} optimal_marker.name`
-- **G=0 (no marker)**: Speaker says `{python} optimal_no_marker.name`
-
-This is RATIONAL context-dependent compression, not inconsistency.
-:::
-
-## 2. Listener Trust Dynamics
-
-When a listener observes advice revision (e.g., doctor says "drug works" to one patient, then "drug doesn't work" to another), their trust update depends on their prior beliefs about world complexity.
-
-**Key insight**: The same observation produces *opposite* trust updates!
-
-- Listener who believes world is **simple**: Trust *decreases* ("Doctor is contradicting themselves!")
-- Listener who believes world is **complex**: Trust *increases* ("Doctor is appropriately adapting to context!")
+Two listeners with different priors about world complexity observe the same advice revision (doctor says "drug works" to one patient, then "drug doesn't work" to another).
 
 ```{python}
-# Create two listeners with different priors
 listener_simple = TrustModel.create_simple_believer(reliability_prior=0.8)
 listener_complex = TrustModel.create_complex_believer(reliability_prior=0.8)
 
-print("Listener A (Simple Believer)")
-print(f"  Prior P(world=simple) = 0.9")
-print(f"  Prior P(speaker=reliable) = {listener_simple.get_reliability_belief():.2f}")
-
-print("\nListener B (Complex Believer)")
-print(f"  Prior P(world=complex) = 0.9")
-print(f"  Prior P(speaker=reliable) = {listener_complex.get_reliability_belief():.2f}")
+print("Listener A (Simple Believer): P(world=simple) = 0.9")
+print("Listener B (Complex Believer): P(world=complex) = 0.9")
+print(f"Both start with P(speaker=reliable) = 0.80")
 ```
 
-### Observing Advice Revision
+### Trust updates after revision
 
 ```{python}
-print("Observation: Doctor revises advice")
-print("  T1: 'Drug works' (to patient with marker)")
-print("  T2: 'Drug doesn't work' (to patient without marker)")
-print("\n" + "=" * 60)
-
-# Update Listener A (simple believer)
 result_simple = listener_simple.update('revision')
-print("\nListener A (believes world is SIMPLE):")
-print(f"  Trust: {result_simple['prior_reliable']:.2f} -> {result_simple['posterior_reliable']:.3f}")
-print(f"  Trust delta: {result_simple['trust_delta']:+.3f}")
-if result_simple['trust_delta'] < 0:
-    print("  -> TRUST DECREASED: 'Doctor is contradicting themselves!'")
-
-# Update Listener B (complex believer)
 result_complex = listener_complex.update('revision')
-print("\nListener B (believes world is COMPLEX):")
-print(f"  Trust: {result_complex['prior_reliable']:.2f} -> {result_complex['posterior_reliable']:.3f}")
-print(f"  Trust delta: {result_complex['trust_delta']:+.3f}")
-if result_complex['trust_delta'] > 0:
-    print("  -> TRUST INCREASED: 'Doctor is adapting to context!'")
+
+print("Listener A (simple believer):")
+print(f"  Trust: {result_simple['prior_reliable']:.2f} -> {result_simple['posterior_reliable']:.3f} ({result_simple['trust_delta']:+.3f})")
+
+print("\nListener B (complex believer):")
+print(f"  Trust: {result_complex['prior_reliable']:.2f} -> {result_complex['posterior_reliable']:.3f} ({result_complex['trust_delta']:+.3f})")
 ```
 
-### Visualization
-
 ```{python}
-#| fig-cap: "Opposite trust updates from the same observation"
+#| fig-cap: "Trust updates after observing advice revision"
 #| label: fig-trust-dynamics
 
 fig, ax = plt.subplots(figsize=(8, 5))
 
-# Data
 labels = ['Simple Believer', 'Complex Believer']
 prior_trust = [result_simple['prior_reliable'], result_complex['prior_reliable']]
 posterior_trust = [result_simple['posterior_reliable'], result_complex['posterior_reliable']]
@@ -219,7 +160,6 @@ bars1 = ax.bar(x - width/2, prior_trust, width, label='Before Revision',
 bars2 = ax.bar(x + width/2, posterior_trust, width, label='After Revision',
                color='steelblue', edgecolor='darkblue')
 
-# Add annotations showing direction of change
 for i, (p1, p2) in enumerate(zip(prior_trust, posterior_trust)):
     mid_x = i
     color = 'red' if p2 < p1 else 'green'
@@ -240,38 +180,13 @@ plt.tight_layout()
 plt.show()
 ```
 
-::: {.callout-important}
-## Key Result: Opposite Trust Updates
+## Rate-Distortion Trade-off
 
-Same observation (advice revision) produces opposite trust updates:
-
-| Listener | Prior | Posterior | Change |
-|----------|-------|-----------|--------|
-| Simple Believer | 0.80 | `{python} f"{result_simple['posterior_reliable']:.3f}"` | `{python} f"{result_simple['trust_delta']:+.3f}"` |
-| Complex Believer | 0.80 | `{python} f"{result_complex['posterior_reliable']:.3f}"` | `{python} f"{result_complex['trust_delta']:+.3f}"` |
-
-This is **rational Bayesian inference**, not motivated reasoning. Both listeners are correctly updating given their priors.
-
-**Practical implication**: Before giving context-dependent advice, help listeners understand that the domain IS context-dependent. Otherwise, your nuanced expertise will look like inconsistency.
-:::
-
-## 3. Rate-Distortion Trade-off
-
-Following Zaslavsky et al. (2020), speakers trade off:
-
-- **Rate** (complexity): Entropy of utterance distribution (bits)
-- **Distortion**: Expected information loss (bits)
-
-The rationality parameter $\alpha$ controls this trade-off:
-
-- $\alpha \to 0$: Uniform distribution (low rate, high distortion)
-- $\alpha \to \infty$: Deterministic optimal (high rate, low distortion)
+The rationality parameter $\alpha$ controls the trade-off between utterance complexity (rate) and expected information loss (distortion). $\alpha \to 0$ gives a uniform distribution; $\alpha \to \infty$ gives deterministic selection of the optimal utterance.
 
 ```{python}
-# Define contexts to average over
 contexts = [{'G': 0}, {'G': 1}]
 
-# Compute rate-distortion curve
 rd_data = compute_rate_distortion_curve(
     true_dag=true_dag,
     utterances=utterances,
@@ -280,33 +195,14 @@ rd_data = compute_rate_distortion_curve(
     alpha_range=np.logspace(-1, 2, 50)
 )
 
-print(f"Computed RD curve for {len(rd_data['alpha'])} alpha values")
 print(f"Rate range: [{rd_data['rate'].min():.3f}, {rd_data['rate'].max():.3f}] bits")
 print(f"Distortion range: [{rd_data['distortion'].min():.3f}, {rd_data['distortion'].max():.3f}] bits")
 ```
 
 ```{python}
-#| fig-cap: "Rate-Distortion trade-off curve"
+#| fig-cap: "Rate-distortion trade-off curve"
 #| label: fig-rate-distortion
 
 fig, axes = plot_rate_distortion_curve(rd_data, figsize=(14, 4))
 plt.show()
 ```
-
-**Interpretation**:
-
-- **Low $\alpha$ (left)**: Speaker uses all utterances equally → high distortion, low complexity
-- **High $\alpha$ (right)**: Speaker always picks optimal utterance → low distortion, high complexity
-- The RD curve shows the fundamental trade-off between these objectives
-
-## Summary
-
-This framework provides a principled account of:
-
-1. **Why speakers simplify**: Compression is rational when it preserves decision-relevant information in context
-
-2. **Why advice changes**: Context-dependent compression means the same true model produces different optimal utterances
-
-3. **Why trust varies**: Listeners' complexity priors determine whether revision signals reliability or inconsistency
-
-4. **The efficiency trade-off**: Speakers operate along the rate-distortion frontier, balancing simplicity and accuracy
