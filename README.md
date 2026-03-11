@@ -42,5 +42,5 @@ See `notebooks/demonstrations.qmd` for worked examples with visualizations.
 
 ## References
 
-- Kinney, M., & Lombrozo, T. (2024). Causal Abstraction: A Theoretical Framework for Mechanistic Interpretability. *Cognition*, 248, 105790.
-- Zaslavsky, N., Kemp, C., Regier, T., & Tishby, N. (2020). Efficient compression in color naming and its evolution. *PNAS*, 115(31), 7937-7942.
+- Kinney, D., & Lombrozo, T. (2024). Building compressed causal models of the world. Cognitive Psychology, 155, 101682.
+- - Zaslavsky, N., Kemp, C., Regier, T., & Tishby, N. (2020). Efficient compression in color naming and its evolution. *PNAS*, 115(31), 7937-7942.
