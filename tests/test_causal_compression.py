@@ -9,10 +9,120 @@ from models import (
     compute_cmi, compute_cmi_multivar,
     compute_contextual_kl,
     CompressionSpeaker,
-    build_simple_medical_dag, build_complex_medical_dag, build_mask_advice_dag,
-    build_trust_update_scenario,
     RSATrustModel,
 )
+
+
+# ---------------------------------------------------------------------------
+# Test fixture DAG builders (moved from examples.py)
+# ---------------------------------------------------------------------------
+
+def build_simple_medical_dag():
+    """T -> Y, treatment has direct positive effect."""
+    variables = {
+        'T': Variable('T', (0, 1)),
+        'Y': Variable('Y', (0, 1)),
+    }
+    parents = {'T': [], 'Y': ['T']}
+
+    def cpt_T(p): return np.array([0.5, 0.5])
+    def cpt_Y(p):
+        return np.array([0.2, 0.8]) if p['T'] == 1 else np.array([0.7, 0.3])
+
+    return CausalDAG(variables, parents, {'T': cpt_T, 'Y': cpt_Y})
+
+
+def build_complex_medical_dag():
+    """T -> Y <- M, treatment effect moderated by M."""
+    variables = {
+        'M': Variable('M', (0, 1)),
+        'T': Variable('T', (0, 1)),
+        'Y': Variable('Y', (0, 1)),
+    }
+    parents = {'M': [], 'T': [], 'Y': ['T', 'M']}
+
+    def cpt_M(p): return np.array([0.5, 0.5])
+    def cpt_T(p): return np.array([0.5, 0.5])
+    def cpt_Y(p):
+        t, m = p['T'], p['M']
+        if m == 0:
+            return np.array([0.1, 0.9]) if t == 1 else np.array([0.3, 0.7])
+        else:
+            return np.array([0.4, 0.6]) if t == 1 else np.array([0.8, 0.2])
+
+    return CausalDAG(variables, parents, {'M': cpt_M, 'T': cpt_T, 'Y': cpt_Y})
+
+
+def build_mask_advice_dag():
+    """R, M -> I, mask effect varies by transmission rate."""
+    variables = {
+        'R': Variable('R', (0, 1)),
+        'M': Variable('M', (0, 1)),
+        'I': Variable('I', (0, 1)),
+    }
+    parents = {'R': [], 'M': [], 'I': ['R', 'M']}
+
+    def cpt_R(p): return np.array([0.5, 0.5])
+    def cpt_M(p): return np.array([0.5, 0.5])
+    def cpt_I(p):
+        r, m = p['R'], p['M']
+        if r == 0:
+            return np.array([0.95, 0.05]) if m == 1 else np.array([0.90, 0.10])
+        else:
+            return np.array([0.70, 0.30]) if m == 1 else np.array([0.30, 0.70])
+
+    return CausalDAG(variables, parents, {'R': cpt_R, 'M': cpt_M, 'I': cpt_I})
+
+
+def build_trust_update_scenario():
+    """Returns dict with simple_dag, complex_dag, utterances, effect_var, contexts."""
+    vars_dy = {'D': Variable('D', (0, 1)), 'Y': Variable('Y', (0, 1))}
+    parents_dy = {'D': [], 'Y': ['D']}
+
+    def cpt_D(p): return np.array([0.5, 0.5])
+
+    def cpt_Y_works(p):
+        return np.array([0.1, 0.9]) if p['D'] == 1 else np.array([0.5, 0.5])
+
+    def cpt_Y_doesnt(p):
+        return np.array([0.8, 0.2]) if p['D'] == 1 else np.array([0.5, 0.5])
+
+    dag_works = CausalDAG(vars_dy, parents_dy, {'D': cpt_D, 'Y': cpt_Y_works})
+    dag_doesnt = CausalDAG(vars_dy, parents_dy, {'D': cpt_D, 'Y': cpt_Y_doesnt})
+
+    utterances = [
+        Utterance("drug_works", dag_works, "stability"),
+        Utterance("drug_doesnt_work", dag_doesnt, "stability"),
+    ]
+
+    def cpt_Y_simple(p):
+        return np.array([0.15, 0.85]) if p['D'] == 1 else np.array([0.55, 0.45])
+    simple_dag = CausalDAG(vars_dy, parents_dy, {'D': cpt_D, 'Y': cpt_Y_simple})
+
+    vars_gdy = {
+        'G': Variable('G', (0, 1)),
+        'D': Variable('D', (0, 1)),
+        'Y': Variable('Y', (0, 1)),
+    }
+    parents_gdy = {'G': [], 'D': [], 'Y': ['G', 'D']}
+
+    def cpt_G(p): return np.array([0.5, 0.5])
+    def cpt_Y_complex(p):
+        g, d = p['G'], p['D']
+        if   g == 1 and d == 1: return np.array([0.1, 0.9])
+        elif g == 1 and d == 0: return np.array([0.4, 0.6])
+        elif g == 0 and d == 1: return np.array([0.8, 0.2])
+        else:                   return np.array([0.6, 0.4])
+    complex_dag = CausalDAG(vars_gdy, parents_gdy,
+                            {'G': cpt_G, 'D': cpt_D, 'Y': cpt_Y_complex})
+
+    return {
+        'simple_dag': simple_dag,
+        'complex_dag': complex_dag,
+        'utterances': utterances,
+        'effect_var': 'Y',
+        'contexts': [{'G': 0}, {'G': 1}],
+    }
 
 
 class TestCausalDAG:

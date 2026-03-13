@@ -1,17 +1,207 @@
+"""
+RSA communication model for causal compression.
+
+Builds on Kinney & Lombrozo (2024) causal compression framework
+and the epistemic vigilance / selective truth-telling framework.
+
+Components:
+    Utterance: A compressed causal model (the speaker's message)
+    compute_contextual_kl: Context-specific prediction loss (KL divergence)
+    CompressionSpeaker: Speaker that trades off compression vs informativeness
+    RSATrustModel: Vigilant listener that jointly infers world and speaker goal
+    compute_rate_distortion_curve: Rate-distortion trade-off analysis
+    compute_trust_curve: Trust delta sweep over priors
+"""
+
 import numpy as np
 import jax.numpy as jnp
 from memo import memo
 from enum import IntEnum
-from typing import Dict, List, Tuple
-
+from typing import Dict, List, Tuple, Optional, Callable
+from dataclasses import dataclass
 from scipy.special import softmax as scipy_softmax
 
 from .kinney_lombrozo import CausalDAG
-from .speaker import Utterance, CompressionSpeaker
 
 
 # ---------------------------------------------------------------------------
-# Domains  (IntEnum, following the memo pattern)
+# Context-specific KL divergence
+# ---------------------------------------------------------------------------
+
+def compute_contextual_kl(
+    true_dag: CausalDAG,
+    abstracted_dag: CausalDAG,
+    effect_var: str,
+    context: Dict[str, int]
+) -> float:
+    """
+    KL divergence between true and compressed effect predictions in context.
+
+    KL[ P_G(Y|do(c)) || P_compressed(Y|do(c)) ]
+
+    This measures how much prediction accuracy is lost by using the
+    compressed model in a specific context c. It is used as the speaker's
+    loss function.
+
+    This is NOT the global information loss L(C, C', E) (which is a CMI
+    difference averaged over all interventions). This is a context-specific
+    measure for the speaker model.
+    """
+    effect = true_dag.variables[effect_var]
+
+    # P_G(Y | do(c)), filtering context to variables in true DAG
+    context_true = {k: v for k, v in context.items()
+                    if k in true_dag.variables}
+    joint_true = true_dag.compute_joint(interventions=context_true)
+    var_names_true = list(true_dag.variables.keys())
+    e_idx_true = var_names_true.index(effect_var)
+
+    p_y_true = {e: 0.0 for e in effect.domain}
+    for vals, prob in joint_true.items():
+        p_y_true[vals[e_idx_true]] += prob
+
+    # P_compressed(Y | do(c)), filtering context to variables in compressed DAG
+    context_filtered = {k: v for k, v in context.items()
+                       if k in abstracted_dag.variables}
+
+    joint_abs = abstracted_dag.compute_joint(interventions=context_filtered)
+    var_names_abs = list(abstracted_dag.variables.keys())
+
+    if effect_var not in var_names_abs:
+        return float('inf')
+
+    e_idx_abs = var_names_abs.index(effect_var)
+
+    p_y_abs = {e: 0.0 for e in effect.domain}
+    for vals, prob in joint_abs.items():
+        p_y_abs[vals[e_idx_abs]] += prob
+
+    # KL(P_true || P_compressed)
+    kl = 0.0
+    for e in effect.domain:
+        if p_y_true[e] > 0:
+            if p_y_abs[e] > 0:
+                kl += p_y_true[e] * np.log2(p_y_true[e] / p_y_abs[e])
+            else:
+                return float('inf')
+
+    return kl
+
+
+# ---------------------------------------------------------------------------
+# Utterance
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Utterance:
+    """
+    An utterance representing a compressed/abstracted causal model.
+
+    Attributes:
+        name: Human-readable description
+        abstracted_dag: The simplified DAG this utterance implies
+        compression_type: 'proportionality' (coarsening) or 'stability' (eliding)
+    """
+    name: str
+    abstracted_dag: CausalDAG
+    compression_type: str  # 'proportionality', 'stability', or 'full'
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        return self.name == other.name
+
+
+# ---------------------------------------------------------------------------
+# CompressionSpeaker
+# ---------------------------------------------------------------------------
+
+class CompressionSpeaker:
+    """
+    Speaker model that chooses utterances by trading off compression vs informativeness.
+
+    P_S(u|G,c) proportional to exp[-alpha * L_c(G, G_tilde(u))] * I[Valid(G_tilde(u), G)]
+
+    Key property: Same G can produce different optimal u for different c
+    (context-dependent compression).
+    """
+
+    def __init__(
+        self,
+        true_dag: CausalDAG,
+        utterances: List[Utterance],
+        effect_var: str,
+        alpha: float = 1.0,
+        validity_check: Optional[Callable] = None
+    ):
+        self.true_dag = true_dag
+        self.utterances = utterances
+        self.effect_var = effect_var
+        self.alpha = alpha
+        self.validity_check = validity_check or (lambda g, u: True)
+
+    def compute_losses(self, context: Dict[str, int]) -> Dict[str, float]:
+        """Compute contextual KL loss for each utterance given context."""
+        losses = {}
+        for u in self.utterances:
+            if self.validity_check(self.true_dag, u):
+                loss = compute_contextual_kl(
+                    self.true_dag,
+                    u.abstracted_dag,
+                    self.effect_var,
+                    context
+                )
+                losses[u.name] = loss
+            else:
+                losses[u.name] = float('inf')
+        return losses
+
+    def get_utterance_probs(self, context: Dict[str, int]) -> Dict[str, float]:
+        """
+        Compute P_S(u|G,c) for all utterances.
+
+        Returns dict mapping utterance names to probabilities.
+        """
+        losses = self.compute_losses(context)
+
+        # Filter out invalid utterances (inf loss)
+        valid_losses = {u: l for u, l in losses.items() if l < float('inf')}
+
+        if not valid_losses:
+            # No valid utterances - uniform over all
+            n = len(self.utterances)
+            return {u.name: 1.0/n for u in self.utterances}
+
+        # Softmax over negative losses
+        names = list(valid_losses.keys())
+        neg_losses = np.array([-valid_losses[n] for n in names])
+        probs = scipy_softmax(self.alpha * neg_losses)
+
+        result = {u.name: 0.0 for u in self.utterances}
+        for name, prob in zip(names, probs):
+            result[name] = prob
+
+        return result
+
+    def sample_utterance(self, context: Dict[str, int]) -> Utterance:
+        """Sample an utterance given context."""
+        probs = self.get_utterance_probs(context)
+        names = list(probs.keys())
+        p = [probs[n] for n in names]
+
+        chosen_name = np.random.choice(names, p=p)
+        return next(u for u in self.utterances if u.name == chosen_name)
+
+    def get_optimal_utterance(self, context: Dict[str, int]) -> Utterance:
+        """Get the most probable utterance given context."""
+        probs = self.get_utterance_probs(context)
+        best_name = max(probs, key=probs.get)
+        return next(u for u in self.utterances if u.name == best_name)
+
+
+# ---------------------------------------------------------------------------
+# RSA domains (IntEnum, following the memo pattern)
 # ---------------------------------------------------------------------------
 
 class Utt(IntEnum):
@@ -130,7 +320,7 @@ DEFAULT_PRIOR_GOAL = {
 
 
 # ---------------------------------------------------------------------------
-# RSATrustModel  wrapper
+# RSATrustModel wrapper
 # ---------------------------------------------------------------------------
 
 class RSATrustModel:
@@ -205,10 +395,6 @@ class RSATrustModel:
                     informative_table[wi, ci, ui] = probs[u.name]
 
         # Persuasive speakers: utility = expected outcome under compressed DAG
-        #   V_pers+(u, c) = P(Y=1 | u's DAG, c)    (inflate outcome belief)
-        #   V_pers-(u, c) = P(Y=0 | u's DAG, c)    (deflate outcome belief)
-        # These don't depend on the true world -- only on what the
-        # compressed DAG implies -- matching the paper's formulation.
         persuade_up_table = np.zeros((n_worlds, n_ctx, n_utt))
         persuade_down_table = np.zeros((n_worlds, n_ctx, n_utt))
 
@@ -383,3 +569,112 @@ class RSATrustModel:
             glabel = GOAL_NAMES[g]
             result[(wname, glabel)] = float(self._speaker_table[si, c_idx, u_idx])
         return result
+
+
+# ---------------------------------------------------------------------------
+# Analysis tools
+# ---------------------------------------------------------------------------
+
+def compute_rate_distortion_curve(
+    true_dag: CausalDAG,
+    utterances: List[Utterance],
+    effect_var: str,
+    contexts: List[Dict[str, int]],
+    alpha_range: Optional[np.ndarray] = None
+) -> Dict[str, np.ndarray]:
+    """
+    Compute the Rate-Distortion trade-off curve.
+
+    The alpha parameter controls the trade-off:
+    - alpha -> 0: Uniform distribution (minimal complexity, maximal distortion)
+    - alpha -> inf: Deterministic optimal (maximal complexity, minimal distortion)
+    """
+    if alpha_range is None:
+        alpha_range = np.logspace(-1, 2, 50)
+
+    rates = []
+    distortions = []
+
+    for alpha in alpha_range:
+        speaker = CompressionSpeaker(
+            true_dag=true_dag,
+            utterances=utterances,
+            effect_var=effect_var,
+            alpha=alpha
+        )
+
+        avg_entropy = 0.0
+        avg_distortion = 0.0
+
+        for context in contexts:
+            probs = speaker.get_utterance_probs(context)
+            losses = speaker.compute_losses(context)
+
+            p_array = np.array(list(probs.values()))
+            p_array = p_array[p_array > 1e-10]
+            entropy = -np.sum(p_array * np.log2(p_array))
+
+            expected_loss = sum(probs[u.name] * losses[u.name]
+                               for u in utterances if losses[u.name] < float('inf'))
+
+            avg_entropy += entropy
+            avg_distortion += expected_loss
+
+        avg_entropy /= len(contexts)
+        avg_distortion /= len(contexts)
+
+        rates.append(avg_entropy)
+        distortions.append(avg_distortion)
+
+    return {
+        'alpha': alpha_range,
+        'rate': np.array(rates),
+        'distortion': np.array(distortions)
+    }
+
+
+def compute_trust_curve(
+    world_dags: Dict[str, CausalDAG],
+    utterances: List[Utterance],
+    effect_var: str,
+    observations: List[tuple],
+    prior_complex_range: np.ndarray,
+    prior_goal: Optional[Dict[str, float]] = None,
+    speaker_alpha: float = 10.0,
+    contexts: List[Dict[str, int]] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Sweep P(C=complex) from 0 to 1 and compute trust_delta at each value.
+
+    Args:
+        world_dags: {'simple': dag, 'complex': dag}
+        utterances: Shared 2-utterance set
+        effect_var: Outcome variable name
+        observations: List of (context_dict, utterance_name) pairs
+        prior_complex_range: Array of P(C=complex) values to sweep
+        prior_goal: Prior over speaker goals (default: uniform over 4 types)
+        speaker_alpha: Rationality parameter
+        contexts: List of context dicts for speaker table precomputation
+    """
+    trust_deltas = []
+    complexity_deltas = []
+
+    for p_complex in prior_complex_range:
+        model = RSATrustModel(
+            world_dags=world_dags,
+            utterances=utterances,
+            effect_var=effect_var,
+            prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
+            prior_goal=prior_goal,
+            speaker_alpha=speaker_alpha,
+            contexts=contexts,
+        )
+        result = model.update(observations)
+        trust_deltas.append(result['trust_delta'])
+        complexity_deltas.append(result['complexity_delta'])
+
+    return {
+        'prior_complex': np.array(prior_complex_range),
+        'trust_delta': np.array(trust_deltas),
+        'complexity_delta': np.array(complexity_deltas),
+    }

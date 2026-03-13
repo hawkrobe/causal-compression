@@ -1,5 +1,5 @@
 ---
-title: "Causal Compression Demonstrations"
+title: "Causal Compression as Selective Truth-Telling"
 format:
   html:
     code-fold: true
@@ -7,423 +7,366 @@ format:
 jupyter: python3
 ---
 
-## When does simplifying causal knowledge backfire?
-
-Experts compress complex causal knowledge into simple advice. A doctor who knows a drug's effectiveness depends on a genetic marker might just say "take the drug" or "don't take the drug." This compression is *context-dependent*: the same expert gives different advice to different patients, not because they're unreliable, but because the underlying causal structure demands it.
-
-The problem: a listener who doesn't know the causal structure might interpret context-sensitive advice as a sign the speaker is confused, unreliable, or manipulative. Whether compression backfires depends on:
-
-1. **Complexity prior** — does the listener expect the world to be simple or complex?
-2. **Vigilance** — does the listener entertain non-informative speaker types (persuasive, unreliable)?
-
 ```{python}
 import sys
 sys.path.insert(0, '..')
 
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.special import softmax
+from itertools import combinations, product as iproduct
 
-from models import (
-    Variable, CausalDAG, Utterance,
-    CompressionSpeaker,
-    RSATrustModel, Goal,
-    compute_rate_distortion_curve,
-    compute_trust_curve,
-    build_drug_marker_scenario,
-    build_trust_update_scenario,
+from models import Variable, CausalDAG, compress_dag, compute_contextual_kl
+```
+
+## Two Worlds
+
+Both worlds share the structure G → Y ← D, differing in whether G modulates D's effect:
+
+- **Simple**: G has no effect on Y
+- **Complex**: G modulates D's effect
+
+```{python}
+def cpt_uniform(p):
+    return np.array([0.5, 0.5])
+
+def cpt_Y_simple(p):
+    if p['D'] == 1: return np.array([0.15, 0.85])
+    else:           return np.array([0.55, 0.45])
+
+simple_dag = CausalDAG(
+    variables={
+        'G': Variable('G', (0, 1)),
+        'D': Variable('D', (0, 1)),
+        'Y': Variable('Y', (0, 1)),
+    },
+    parents={'G': [], 'D': [], 'Y': ['G', 'D']},
+    cpts={'G': cpt_uniform, 'D': cpt_uniform, 'Y': cpt_Y_simple},
 )
-```
 
-## The Speaker's Compression Problem
+def cpt_Y_complex(p):
+    g, d = p['G'], p['D']
+    if   g == 1 and d == 1: return np.array([0.10, 0.90])
+    elif g == 1 and d == 0: return np.array([0.40, 0.60])
+    elif g == 0 and d == 1: return np.array([0.80, 0.20])
+    else:                   return np.array([0.60, 0.40])
 
-A drug's effectiveness depends on a genetic marker G. G=1: 90% success. G=0: 20% success. The speaker must compress this into one of two utterances.
-
-```{python}
-true_dag, utterances = build_drug_marker_scenario()
-
-speaker = CompressionSpeaker(
-    true_dag=true_dag,
-    utterances=utterances,
-    effect_var='Y',
-    alpha=10.0
+complex_dag = CausalDAG(
+    variables={
+        'G': Variable('G', (0, 1)),
+        'D': Variable('D', (0, 1)),
+        'Y': Variable('Y', (0, 1)),
+    },
+    parents={'G': [], 'D': [], 'Y': ['G', 'D']},
+    cpts={'G': cpt_uniform, 'D': cpt_uniform, 'Y': cpt_Y_complex},
 )
 
-context_marker = {'G': 1}
-context_no_marker = {'G': 0}
+worlds = {'simple': simple_dag, 'complex': complex_dag}
+```
 
-losses_marker = speaker.compute_losses(context_marker)
-probs_marker = speaker.get_utterance_probs(context_marker)
+## Compressions as Utterances
 
-losses_no_marker = speaker.compute_losses(context_no_marker)
-probs_no_marker = speaker.get_utterance_probs(context_no_marker)
+Compression space = power set of cause variables {G, D}:
 
-print(f"G=1 → optimal: '{speaker.get_optimal_utterance(context_marker).name}'")
-print(f"G=0 → optimal: '{speaker.get_optimal_utterance(context_no_marker).name}'")
+| Compression | Structure |
+|-------------|-----------|
+| full | G → Y ← D |
+| drop_G | D → Y |
+| drop_D | G → Y |
+| null | Y |
+
+In the simple world, `drop_G` has zero information loss. In the complex world, it loses information.
+
+```{python}
+def enumerate_compressions(dag, effect_var='Y'):
+    cause_vars = sorted(v for v in dag.variables if v != effect_var)
+    effect = dag.variables[effect_var]
+    compressions = {}
+
+    for r in range(len(cause_vars) + 1):
+        for subset in combinations(cause_vars, r):
+            kept = set(subset)
+            dropped = set(cause_vars) - kept
+
+            if len(kept) == len(cause_vars):
+                name = 'full'
+                compressions[name] = dag
+            elif len(kept) == 1:
+                var = subset[0]
+                name = f'drop_{"_".join(sorted(dropped))}'
+                identity_map = {v: v for v in dag.variables[var].domain}
+                compressions[name] = compress_dag(dag, var, effect_var, identity_map)
+            elif len(kept) == 0:
+                name = 'null'
+                joint = dag.compute_joint()
+                var_names = list(dag.variables.keys())
+                e_idx = var_names.index(effect_var)
+                p_e = np.zeros(len(effect.domain))
+                for vals, prob in joint.items():
+                    p_e[effect.domain.index(vals[e_idx])] += prob
+                compressions[name] = CausalDAG(
+                    variables={effect_var: Variable(effect_var, effect.domain)},
+                    parents={effect_var: []},
+                    cpts={effect_var: lambda p, _m=p_e: _m},
+                )
+            else:
+                name = f'drop_{"_".join(sorted(dropped))}'
+                retained = list(subset)
+                ret_domains = [dag.variables[v].domain for v in retained]
+                var_names = list(dag.variables.keys())
+                e_idx = var_names.index(effect_var)
+
+                cpt_table = {}
+                for combo in iproduct(*ret_domains):
+                    interventions = dict(zip(retained, combo))
+                    joint = dag.compute_joint(interventions=interventions)
+                    p_e = np.zeros(len(effect.domain))
+                    for vals, prob in joint.items():
+                        p_e[effect.domain.index(vals[e_idx])] += prob
+                    cpt_table[combo] = p_e
+
+                variables = {v: Variable(v, dag.variables[v].domain) for v in retained}
+                variables[effect_var] = Variable(effect_var, effect.domain)
+                parents = {v: [] for v in retained}
+                parents[effect_var] = retained
+                cpts = {v: (lambda p, _d=dag.variables[v].domain:
+                            np.ones(len(_d)) / len(_d)) for v in retained}
+                cpts[effect_var] = (lambda p, _rv=retained, _ct=cpt_table:
+                                    _ct[tuple(p[v] for v in _rv)])
+
+                compressions[name] = CausalDAG(variables, parents, cpts)
+
+    return compressions
+
+compressed = {w: enumerate_compressions(dag) for w, dag in worlds.items()}
+utt_names = ['full', 'drop_G', 'drop_D', 'null']
 ```
 
 ```{python}
-#| fig-cap: "Utterance probabilities and information loss by context"
-#| label: fig-context-compression
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-utterance_names = list(probs_marker.keys())
-x = np.arange(len(utterance_names))
-width = 0.35
-
-ax = axes[0]
-ax.bar(x - width/2, [probs_marker[u] for u in utterance_names], width,
-       label='G=1 (has marker)', color='steelblue')
-ax.bar(x + width/2, [probs_no_marker[u] for u in utterance_names], width,
-       label='G=0 (no marker)', color='coral')
-ax.set_ylabel('P(utterance | context)')
-ax.set_title('Utterance Probabilities by Context')
-ax.set_xticks(x)
-ax.set_xticklabels(utterance_names, rotation=15)
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-ax = axes[1]
-losses_marker_finite = {k: v if v < 10 else 10 for k, v in losses_marker.items()}
-losses_no_marker_finite = {k: v if v < 10 else 10 for k, v in losses_no_marker.items()}
-
-ax.bar(x - width/2, [losses_marker_finite[u] for u in utterance_names], width,
-       label='G=1 (has marker)', color='steelblue')
-ax.bar(x + width/2, [losses_no_marker_finite[u] for u in utterance_names], width,
-       label='G=0 (no marker)', color='coral')
-ax.set_ylabel('Information Loss (bits)')
-ax.set_title('Information Loss by Context')
-ax.set_xticks(x)
-ax.set_xticklabels(utterance_names, rotation=15)
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
+print("P(Y=1 | do(D=1)) by world and compression:\n")
+for w in ['simple', 'complex']:
+    print(f"  {w}:")
+    for name in utt_names:
+        cdag = compressed[w][name]
+        if 'D' in cdag.variables:
+            joint = cdag.compute_joint(interventions={'D': 1})
+            vn = list(cdag.variables.keys())
+            p_y1 = sum(prob for vals, prob in joint.items() if vals[vn.index('Y')] == 1)
+            print(f"    {name:>8s}: P(Y=1|do(D=1)) = {p_y1:.3f}")
+        else:
+            joint = cdag.compute_joint()
+            vn = list(cdag.variables.keys())
+            p_y1 = sum(prob for vals, prob in joint.items() if vals[vn.index('Y')] == 1)
+            print(f"    {name:>8s}: P(Y=1) = {p_y1:.3f}  (no D)")
+    print()
 ```
 
-## Rate-Distortion Trade-off
+## Speaker Model
 
-$\alpha$ controls the trade-off between utterance complexity (rate) and information loss (distortion).
+$P_{S_1}(\sigma \mid w, \psi, c) \propto \exp[\alpha \cdot V(\sigma, w, \psi, c)]$
+
+- **Informative**: $V = -\text{KL}(P_w \| P_\sigma)$, averaged over do(D) interventions
+- **Persuade-up**: $V = P_\sigma(Y{=}1 \mid \text{do}(D{=}1), c)$
+- **Persuade-down**: $V = P_\sigma(Y{=}0 \mid \text{do}(D{=}1), c)$
 
 ```{python}
+def p_y1_given_do_d1(cdag, context):
+    if 'D' not in cdag.variables:
+        joint = cdag.compute_joint(interventions={k: v for k, v in context.items()
+                                                   if k in cdag.variables})
+        vn = list(cdag.variables.keys())
+        return sum(prob for vals, prob in joint.items() if vals[vn.index('Y')] == 1)
+    interv = {'D': 1}
+    interv.update({k: v for k, v in context.items() if k in cdag.variables})
+    joint = cdag.compute_joint(interventions=interv)
+    vn = list(cdag.variables.keys())
+    return sum(prob for vals, prob in joint.items() if vals[vn.index('Y')] == 1)
+
+
+def compute_speaker_utilities(dag, compressions, context=None, effect_var='Y'):
+    if context is None:
+        context = {}
+    utilities = {}
+    for name, cdag in compressions.items():
+        if 'D' in cdag.variables:
+            kl_total = sum(
+                0.5 * compute_contextual_kl(dag, cdag, effect_var, {**context, 'D': d})
+                for d in [0, 1]
+            )
+            utilities.setdefault('informative', {})[name] = -kl_total
+        else:
+            utilities.setdefault('informative', {})[name] = -10.0
+
+        p_y1 = p_y1_given_do_d1(cdag, context)
+        utilities.setdefault('persuade_up', {})[name] = p_y1
+        utilities.setdefault('persuade_down', {})[name] = 1.0 - p_y1
+    return utilities
+```
+
+```{python}
+#| fig-cap: "Speaker compression choices by world and context"
+#| label: fig-speaker
+
+alpha = 5.0
 contexts = [{'G': 0}, {'G': 1}]
+goal_names = ['informative', 'persuade_up', 'persuade_down']
 
-rd_data = compute_rate_distortion_curve(
-    true_dag=true_dag,
-    utterances=utterances,
-    effect_var='Y',
-    contexts=contexts,
-    alpha_range=np.logspace(-1, 2, 50)
-)
+fig, axes = plt.subplots(2, 6, figsize=(22, 8), sharey=True)
+
+for row, ctx in enumerate(contexts):
+    for wi, (wname, dag) in enumerate(worlds.items()):
+        utils = compute_speaker_utilities(dag, compressed[wname], context=ctx)
+        for gi, goal in enumerate(goal_names):
+            col = wi * 3 + gi
+            ax = axes[row, col]
+            u_vals = np.array([utils[goal].get(u, -10) for u in utt_names])
+            probs = softmax(alpha * u_vals)
+            bars = ax.bar(utt_names, probs,
+                          color=['steelblue', 'coral', 'seagreen', 'gray'])
+            ax.set_ylim(0, 1.05)
+            ax.set_title(f'{wname} / {goal}', fontsize=9)
+            if col == 0:
+                ax.set_ylabel(f'G={ctx["G"]}')
+            ax.grid(True, alpha=0.3)
+            ax.tick_params(axis='x', labelsize=7, rotation=45)
+            for bar, p in zip(bars, probs):
+                if p > 0.05:
+                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
+                           f'{p:.2f}', ha='center', va='bottom', fontsize=7)
+
+plt.suptitle(f'Speaker choices (α={alpha})', fontsize=14, y=1.02)
+plt.tight_layout()
+plt.show()
+```
+
+## Selective Truth-Telling
+
+Informative speaker: simple world is indifferent between `full` and `drop_G`; complex world prefers `full`.
+
+Persuade-up speaker in complex world: prefers `drop_G` when G=0 (hides bad prognosis), `full` when G=1 (reveals good prognosis). Simple world: indifferent.
+
+```{python}
+print(f"Speaker preferences (α={alpha}):\n")
+for wname in ['simple', 'complex']:
+    for ctx in [{'G': 0}, {'G': 1}]:
+        print(f"  {wname}, G={ctx['G']}:")
+        utils = compute_speaker_utilities(worlds[wname], compressed[wname], context=ctx)
+        for goal in goal_names:
+            u_vals = np.array([utils[goal].get(u, -10) for u in utt_names])
+            probs = softmax(alpha * u_vals)
+            best = utt_names[np.argmax(probs)]
+            print(f"    {goal:>14s} → {best} ({probs[np.argmax(probs)]:.2f})")
+    print()
+```
+
+## Vigilant Listener
+
+$P_{L_1}(w, \psi \mid \sigma, c) \propto P(w) \cdot P(\psi) \cdot P_{S_1}(\sigma \mid w, \psi, c)$
+
+```{python}
+def vigilant_listener(compression_name, worlds, compressed, context=None,
+                      alpha=5.0, prior_world=None, prior_goal=None):
+    if context is None:
+        context = {}
+    world_names = list(worlds.keys())
+    if prior_world is None:
+        prior_world = {w: 1/len(world_names) for w in world_names}
+    if prior_goal is None:
+        prior_goal = {g: 1/len(goal_names) for g in goal_names}
+
+    posterior = {}
+    for w in world_names:
+        utils = compute_speaker_utilities(worlds[w], compressed[w], context=context)
+        for g in goal_names:
+            u_vals = np.array([utils[g].get(u, -10) for u in utt_names])
+            probs = softmax(alpha * u_vals)
+            likelihood = probs[utt_names.index(compression_name)]
+            posterior[(w, g)] = prior_world[w] * prior_goal[g] * likelihood
+
+    total = sum(posterior.values())
+    return {k: v / total for k, v in posterior.items()}
 ```
 
 ```{python}
-#| fig-cap: "Rate-distortion trade-off curve"
-#| label: fig-rate-distortion
+#| fig-cap: "Listener inference from observed compression (G=0 context)"
+#| label: fig-listener
 
-fig, axes = plt.subplots(1, 3, figsize=(14, 4))
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+cmap = {'informative': 'steelblue', 'persuade_up': 'coral', 'persuade_down': 'seagreen'}
 
-ax = axes[0]
-ax.plot(rd_data['rate'], rd_data['distortion'], 'b-', linewidth=2)
-ax.set_xlabel('Rate (bits)')
-ax.set_ylabel('Distortion (bits)')
-ax.set_title('Rate-Distortion Trade-off')
-ax.grid(True, alpha=0.3)
-
-ax = axes[1]
-ax.semilogx(rd_data['alpha'], rd_data['rate'], 'g-', linewidth=2)
-ax.set_xlabel(r'$\alpha$ (rationality)')
-ax.set_ylabel('Rate (bits)')
-ax.set_title('Rate vs Rationality')
-ax.grid(True, alpha=0.3)
-
-ax = axes[2]
-ax.semilogx(rd_data['alpha'], rd_data['distortion'], 'r-', linewidth=2)
-ax.set_xlabel(r'$\alpha$ (rationality)')
-ax.set_ylabel('Distortion (bits)')
-ax.set_title('Distortion vs Rationality')
-ax.grid(True, alpha=0.3)
+for ax, obs in zip(axes, utt_names):
+    post = vigilant_listener(obs, worlds, compressed, context={'G': 0}, alpha=5.0)
+    labels, values, colors = [], [], []
+    for w in ['simple', 'complex']:
+        for g in goal_names:
+            labels.append(f'{w}\n{g}')
+            values.append(post[(w, g)])
+            colors.append(cmap[g])
+    ax.bar(range(len(labels)), values, color=colors)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=7, rotation=45, ha='right')
+    ax.set_ylabel('P(world, goal)')
+    ax.set_title(f'Observed: "{obs}"')
+    ax.set_ylim(0, 0.6)
+    ax.grid(True, alpha=0.3)
 
 plt.tight_layout()
 plt.show()
 ```
 
-## Credulous vs Vigilant Listener
+```{python}
+post = vigilant_listener('drop_G', worlds, compressed, context={'G': 0}, alpha=5.0)
 
-Two listener types observe the same advice:
+print("Posterior after observing drop_G (G=0 context):\n")
+for w in ['simple', 'complex']:
+    for g in goal_names:
+        print(f"  ({w:>7s}, {g:>14s}): {post[(w, g)]:.4f}")
 
-- **Credulous**: assumes $\psi = \text{informative}$, only infers world complexity
-- **Vigilant**: jointly infers world complexity and speaker type $\psi \in \{\text{informative}, \text{persuade-up}, \text{persuade-down}, \text{unreliable}\}$
+p_world = {w: sum(post[(w, g)] for g in goal_names) for w in ['simple', 'complex']}
+p_goal = {g: sum(post[(w, g)] for w in ['simple', 'complex']) for g in goal_names}
 
-Speaker types:
+print(f"\n  P(simple)={p_world['simple']:.3f}  P(complex)={p_world['complex']:.3f}")
+print(f"  P(inf)={p_goal['informative']:.3f}  P(pers+)={p_goal['persuade_up']:.3f}  P(pers-)={p_goal['persuade_down']:.3f}")
+```
 
-| Type | Utility | World-dependent? |
-|------|---------|-----------------|
-| Informative | $-\text{KL}(P_\text{true} \| P_\text{compressed})$ | Yes |
-| Persuade-up | $E[Y{=}1 \mid u, c]$ | No |
-| Persuade-down | $E[Y{=}0 \mid u, c]$ | No |
-| Unreliable | uniform random | No |
+## Credulous vs Vigilant
+
+Credulous listener assumes informative speaker. Vigilant listener entertains persuasive alternatives.
 
 ```{python}
-scenario = build_trust_update_scenario()
-world_dags = {'simple': scenario['simple_dag'], 'complex': scenario['complex_dag']}
+#| fig-cap: "World inference: credulous vs vigilant"
+#| label: fig-credulous-vigilant
+
 prior_range = np.linspace(0.05, 0.95, 40)
 
-revision_obs = [
-    ({'G': 1}, 'drug_works'),
-    ({'G': 0}, 'drug_doesnt_work'),
-]
-consistent_obs = [
-    ({'G': 1}, 'drug_works'),
-    ({'G': 0}, 'drug_works'),
-]
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
 
-credulous_goal = {'informative': 1.0, 'persuade_up': 0.0, 'persuade_down': 0.0, 'unreliable': 0.0}
-vigilant_goal = None  # uses default uniform prior over all 4 types
-```
+for ax, obs_name in zip(axes, utt_names):
+    credulous_complex, vigilant_complex = [], []
 
-### Derived speaker likelihoods
+    for p_c in prior_range:
+        pw = {'simple': 1 - p_c, 'complex': float(p_c)}
 
-Informative likelihoods are world-dependent; persuasive and unreliable likelihoods are not. Revision can only be explained by an informative speaker in a complex world.
+        post_c = vigilant_listener(obs_name, worlds, compressed, context={'G': 0},
+            alpha=5.0, prior_world=pw,
+            prior_goal={'informative': 1.0, 'persuade_up': 0.0, 'persuade_down': 0.0})
+        credulous_complex.append(
+            sum(post_c[(w, g)] for w, g in post_c if w == 'complex'))
 
-```{python}
-rsa_model = RSATrustModel(
-    world_dags=world_dags,
-    utterances=scenario['utterances'],
-    effect_var='Y',
-    prior_world={'simple': 0.5, 'complex': 0.5},
-    speaker_alpha=10.0,
-    contexts=scenario['contexts'],
-)
+        post_v = vigilant_listener(obs_name, worlds, compressed, context={'G': 0},
+            alpha=5.0, prior_world=pw)
+        vigilant_complex.append(
+            sum(post_v[(w, g)] for w, g in post_v if w == 'complex'))
 
-print("P(u | world, goal, context):")
-for ctx_label, ctx in [("G=0", {'G': 0}), ("G=1", {'G': 1})]:
-    for utt in scenario['utterances']:
-        lk = rsa_model.get_derived_likelihoods(ctx, utt.name)
-        print(f"\n  P({utt.name} | {ctx_label}):")
-        for (w, g), p in sorted(lk.items()):
-            print(f"    {w:>8s}, {g:>14s}: {p:.4f}")
-```
-
-### Point comparison at flat prior
-
-```{python}
-def run_both_listeners(obs):
-    results = {}
-    for label, goal in [('Credulous', credulous_goal), ('Vigilant', vigilant_goal)]:
-        m = RSATrustModel(
-            world_dags=world_dags,
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 0.5, 'complex': 0.5},
-            prior_goal=goal,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        results[label] = m.update(obs)
-    return results
-
-for obs_label, obs in [('REVISION', revision_obs), ('CONSISTENT', consistent_obs)]:
-    print(f"\n{obs_label}:")
-    results = run_both_listeners(obs)
-    for label, r in results.items():
-        trust_str = f"P(inf): {r['posterior_reliable']:.3f}" if label == 'Vigilant' else "P(inf): 1.000"
-        print(f"  {label:10s}  P(complex): {r['posterior_complex']:.3f}   {trust_str}")
-```
-
-### Vigilance attenuates world inference
-
-```{python}
-#| fig-cap: "Credulous vs vigilant: world inference and trust"
-#| label: fig-credulous-vs-vigilant
-
-def sweep_listener(obs, prior_goal):
-    complexity_deltas, trust_deltas = [], []
-    for p in prior_range:
-        m = RSATrustModel(
-            world_dags=world_dags,
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 1-p, 'complex': float(p)},
-            prior_goal=prior_goal,
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        r = m.update(obs)
-        complexity_deltas.append(r['complexity_delta'])
-        trust_deltas.append(r['trust_delta'])
-    return np.array(complexity_deltas), np.array(trust_deltas)
-
-fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
-
-# Panel 1: Complexity delta — revision
-ax = axes[0]
-cd_cred_rev, _ = sweep_listener(revision_obs, credulous_goal)
-cd_vig_rev, _ = sweep_listener(revision_obs, vigilant_goal)
-ax.plot(prior_range, cd_cred_rev, 'r-', linewidth=2, label='Credulous')
-ax.plot(prior_range, cd_vig_rev, 'r--', linewidth=2, label='Vigilant')
-ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
-ax.set_xlabel('P(complex) prior')
-ax.set_ylabel(r'$\Delta$ P(complex)')
-ax.set_title('World Inference: Revision')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-# Panel 2: Complexity delta — consistent
-ax = axes[1]
-cd_cred_con, _ = sweep_listener(consistent_obs, credulous_goal)
-cd_vig_con, _ = sweep_listener(consistent_obs, vigilant_goal)
-ax.plot(prior_range, cd_cred_con, 'b-', linewidth=2, label='Credulous')
-ax.plot(prior_range, cd_vig_con, 'b--', linewidth=2, label='Vigilant')
-ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
-ax.set_xlabel('P(complex) prior')
-ax.set_ylabel(r'$\Delta$ P(complex)')
-ax.set_title('World Inference: Consistent')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-# Panel 3: Trust delta — vigilant only
-ax = axes[2]
-_, td_vig_rev = sweep_listener(revision_obs, vigilant_goal)
-_, td_vig_con = sweep_listener(consistent_obs, vigilant_goal)
-ax.plot(prior_range, td_vig_rev, 'r--', linewidth=2, label='Revision')
-ax.plot(prior_range, td_vig_con, 'b--', linewidth=2, label='Consistent')
-ax.axhline(y=0, color='gray', linestyle='--', alpha=0.3)
-ax.set_xlabel('P(complex) prior')
-ax.set_ylabel(r'$\Delta$ P(informative)')
-ax.set_title('Trust: Vigilant Only')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-```
-
-## Trust Crossover
-
-Whether advice helps or hurts trust depends on the complexity prior. Both observation types cross zero, but at different thresholds.
-
-```{python}
-#| fig-cap: "Trust crossover for the vigilant listener"
-#| label: fig-trust-crossover
-
-fig, ax = plt.subplots(figsize=(8, 5))
-
-ax.plot(prior_range, td_vig_con, 'b-', linewidth=2.5, label='Consistent')
-ax.plot(prior_range, td_vig_rev, 'r--', linewidth=2.5, label='Revision')
-ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-
-for td, color, label in [(td_vig_con, 'blue', 'consistent'),
-                          (td_vig_rev, 'red', 'revision')]:
-    sign_changes = np.where(np.diff(np.sign(td)))[0]
-    if len(sign_changes) > 0:
-        idx = sign_changes[0]
-        x0, x1 = prior_range[idx], prior_range[idx + 1]
-        y0, y1 = td[idx], td[idx + 1]
-        crossover = x0 - y0 * (x1 - x0) / (y1 - y0)
-        ax.plot(crossover, 0, 'o', color=color, markersize=9)
-        offset_y = 0.06 if label == 'revision' else -0.08
-        ax.annotate(
-            f'{label}: {crossover:.2f}',
-            xy=(crossover, 0),
-            xytext=(crossover + 0.08, offset_y),
-            arrowprops=dict(arrowstyle='->', color=color),
-            fontsize=10, color=color,
-        )
-
-ax.set_xlabel('P(world = complex)')
-ax.set_ylabel(r'$\Delta$ P(speaker = informative)')
-ax.set_title('When Does Compression Backfire?')
-ax.legend()
-ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-```
-
-## Effect of Explanation
-
-Explanation shifts the listener's complexity prior upward before observing advice. For consistent advice this increases suspicion; for revision it reinforces the informative interpretation.
-
-```{python}
-#| fig-cap: "Explanation shifts trust curves"
-#| label: fig-explanation-effect
-
-fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-for ax, obs, title in [(axes[0], consistent_obs, 'Consistent'),
-                        (axes[1], revision_obs, 'Revision')]:
-    for strength, color, label in [(0, 'blue', 'No explanation'),
-                                    (1.0, 'orange', 'Moderate'),
-                                    (2.0, 'green', 'Strong')]:
-        deltas = []
-        for p_complex in prior_range:
-            m = RSATrustModel(
-                world_dags=world_dags,
-                utterances=scenario['utterances'],
-                effect_var='Y',
-                prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
-                speaker_alpha=10.0,
-                contexts=scenario['contexts'],
-            )
-            if strength == 0:
-                r = m.update(obs)
-            else:
-                r = m.update_with_explanation(obs, explanation_strength=strength)
-            deltas.append(r['trust_delta'])
-
-        ax.plot(prior_range, deltas, color=color, linewidth=2, label=label)
-
-    ax.axhline(y=0, color='gray', linestyle='--', alpha=0.5)
-    ax.set_xlabel('P(world = complex)')
-    ax.set_ylabel(r'$\Delta$ P(informative)')
-    ax.set_title(title)
-    ax.legend()
+    ax.plot(prior_range, prior_range, 'k:', alpha=0.3, label='No update')
+    ax.plot(prior_range, credulous_complex, 'b-', lw=2, label='Credulous')
+    ax.plot(prior_range, vigilant_complex, 'r--', lw=2, label='Vigilant')
+    ax.set_xlabel('P(complex) prior')
+    ax.set_ylabel('P(complex) posterior')
+    ax.set_title(f'Observed: "{obs_name}"')
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
-
-plt.tight_layout()
-plt.show()
-```
-
-## Speaker Goal Inference
-
-The vigilant listener also infers *why* the speaker said what they said.
-
-```{python}
-#| fig-cap: "Goal inference after revision vs consistent advice"
-#| label: fig-goal-inference
-
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-
-for ax, obs, title in [(axes[0], revision_obs, 'After Revision'),
-                        (axes[1], consistent_obs, 'After Consistent')]:
-    goal_traces = {g: [] for g in ['informative', 'persuade_up', 'persuade_down', 'unreliable']}
-    for p_complex in prior_range:
-        m = RSATrustModel(
-            world_dags=world_dags,
-            utterances=scenario['utterances'],
-            effect_var='Y',
-            prior_world={'simple': 1.0 - p_complex, 'complex': float(p_complex)},
-            speaker_alpha=10.0,
-            contexts=scenario['contexts'],
-        )
-        m.update(obs)
-        goals = m.get_goal_beliefs()
-        for g in goal_traces:
-            goal_traces[g].append(goals[g])
-
-    ax.plot(prior_range, goal_traces['informative'], 'b-', linewidth=2, label='Informative')
-    ax.plot(prior_range, goal_traces['persuade_up'], 'r-', linewidth=2, label='Persuade-up')
-    ax.plot(prior_range, goal_traces['persuade_down'], 'g-', linewidth=2, label='Persuade-down')
-    ax.plot(prior_range, goal_traces['unreliable'], 'k:', linewidth=2, label='Unreliable')
-    ax.axhline(y=1/4, color='gray', linestyle='--', alpha=0.5, label='Prior')
-    ax.set_xlabel('P(world = complex)')
-    ax.set_ylabel('P(goal type)')
-    ax.set_title(title)
-    ax.legend(fontsize=9)
-    ax.set_ylim(-0.05, 1.05)
-    ax.grid(True, alpha=0.3)
+    ax.set_aspect('equal')
 
 plt.tight_layout()
 plt.show()
