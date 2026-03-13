@@ -6,7 +6,7 @@ from typing import Dict, List, Tuple
 
 from scipy.special import softmax as scipy_softmax
 
-from .dag import CausalDAG
+from .kinney_lombrozo import CausalDAG
 from .speaker import Utterance, CompressionSpeaker
 
 
@@ -207,8 +207,8 @@ class RSATrustModel:
         # Persuasive speakers: utility = expected outcome under compressed DAG
         #   V_pers+(u, c) = P(Y=1 | u's DAG, c)    (inflate outcome belief)
         #   V_pers-(u, c) = P(Y=0 | u's DAG, c)    (deflate outcome belief)
-        # These don't depend on the true world — only on what the
-        # compressed DAG implies — matching the paper's formulation.
+        # These don't depend on the true world -- only on what the
+        # compressed DAG implies -- matching the paper's formulation.
         persuade_up_table = np.zeros((n_worlds, n_ctx, n_utt))
         persuade_down_table = np.zeros((n_worlds, n_ctx, n_utt))
 
@@ -224,7 +224,7 @@ class RSATrustModel:
             probs_down = scipy_softmax(speaker_alpha * utils_down)
 
             # Same probabilities for all worlds (persuasive utility is
-            # world-independent — the speaker frames, not lies)
+            # world-independent -- the speaker frames, not lies)
             for wi in range(n_worlds):
                 persuade_up_table[wi, ci, :] = probs_up
                 persuade_down_table[wi, ci, :] = probs_down

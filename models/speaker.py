@@ -4,6 +4,12 @@ Speaker model for causal compression.
 Classes:
     Utterance: A compressed/abstracted causal model utterance
     CompressionSpeaker: Speaker that trades off compression vs informativeness
+
+Functions:
+    compute_contextual_kl: KL divergence between true and compressed
+        predictions in a specific context. This is NOT the global
+        information loss L -- it is a context-specific prediction loss
+        used by the speaker model.
 """
 
 import numpy as np
@@ -11,9 +17,74 @@ from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass
 from scipy.special import softmax as scipy_softmax
 
-from .dag import CausalDAG
-from .information import compute_context_conditioned_loss
+from .kinney_lombrozo import CausalDAG
 
+
+# ---------------------------------------------------------------------------
+# Context-specific KL divergence (our extension, not in the paper)
+# ---------------------------------------------------------------------------
+
+def compute_contextual_kl(
+    true_dag: CausalDAG,
+    abstracted_dag: CausalDAG,
+    effect_var: str,
+    context: Dict[str, int]
+) -> float:
+    """
+    KL divergence between true and compressed effect predictions in context.
+
+    KL[ P_G(Y|do(c)) || P_compressed(Y|do(c)) ]
+
+    This measures how much prediction accuracy is lost by using the
+    compressed model in a specific context c. It is used as the speaker's
+    loss function.
+
+    This is NOT the global information loss L(C, C', E) (which is a CMI
+    difference averaged over all interventions). This is a context-specific
+    measure for the speaker model.
+    """
+    effect = true_dag.variables[effect_var]
+
+    # P_G(Y | do(c))
+    joint_true = true_dag.compute_joint(interventions=context)
+    var_names_true = list(true_dag.variables.keys())
+    e_idx_true = var_names_true.index(effect_var)
+
+    p_y_true = {e: 0.0 for e in effect.domain}
+    for vals, prob in joint_true.items():
+        p_y_true[vals[e_idx_true]] += prob
+
+    # P_compressed(Y | do(c)), filtering context to variables in compressed DAG
+    context_filtered = {k: v for k, v in context.items()
+                       if k in abstracted_dag.variables}
+
+    joint_abs = abstracted_dag.compute_joint(interventions=context_filtered)
+    var_names_abs = list(abstracted_dag.variables.keys())
+
+    if effect_var not in var_names_abs:
+        return float('inf')
+
+    e_idx_abs = var_names_abs.index(effect_var)
+
+    p_y_abs = {e: 0.0 for e in effect.domain}
+    for vals, prob in joint_abs.items():
+        p_y_abs[vals[e_idx_abs]] += prob
+
+    # KL(P_true || P_compressed)
+    kl = 0.0
+    for e in effect.domain:
+        if p_y_true[e] > 0:
+            if p_y_abs[e] > 0:
+                kl += p_y_true[e] * np.log2(p_y_true[e] / p_y_abs[e])
+            else:
+                return float('inf')
+
+    return kl
+
+
+# ---------------------------------------------------------------------------
+# Utterance
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Utterance:
@@ -35,6 +106,10 @@ class Utterance:
     def __eq__(self, other):
         return self.name == other.name
 
+
+# ---------------------------------------------------------------------------
+# CompressionSpeaker
+# ---------------------------------------------------------------------------
 
 class CompressionSpeaker:
     """
@@ -73,7 +148,7 @@ class CompressionSpeaker:
         losses = {}
         for u in self.utterances:
             if self.validity_check(self.true_dag, u):
-                loss = compute_context_conditioned_loss(
+                loss = compute_contextual_kl(
                     self.true_dag,
                     u.abstracted_dag,
                     self.effect_var,

@@ -14,7 +14,7 @@ Functions:
 import numpy as np
 from typing import Dict, List, Tuple
 
-from .dag import Variable, CausalDAG
+from .kinney_lombrozo import Variable, CausalDAG
 from .speaker import Utterance
 
 

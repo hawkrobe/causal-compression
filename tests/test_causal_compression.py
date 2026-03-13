@@ -7,8 +7,8 @@ import pytest
 from models import (
     Variable, CausalDAG, Utterance,
     compute_cmi, compute_cmi_multivar,
-    compute_information_loss, compute_context_conditioned_loss,
-    CompressionSpeaker, CompressionListener,
+    compute_contextual_kl,
+    CompressionSpeaker,
     build_simple_medical_dag, build_complex_medical_dag, build_mask_advice_dag,
     build_trust_update_scenario,
     RSATrustModel,
@@ -127,33 +127,11 @@ class TestCMI:
         assert np.isclose(cmi, 1.0, atol=1e-6)
 
 
-class TestInformationLoss:
-    """Test information loss computation."""
-
-    def test_no_loss_identical_dags(self):
-        """Information loss should be 0 for identical DAGs."""
-        dag = build_simple_medical_dag()
-        loss = compute_information_loss(dag, dag, ['T'], 'Y')
-        assert np.isclose(loss, 0.0, atol=1e-10)
-
-    def test_loss_positive_for_compression(self):
-        """Compression should generally result in positive loss."""
-        complex_dag = build_complex_medical_dag()
-        simple_dag = build_simple_medical_dag()
-
-        # Note: This test may not always pass because the simple dag
-        # has different variable names. Let's build a proper abstraction.
-        # For now, just test the function runs
-        # loss = compute_information_loss(complex_dag, simple_dag, ['T'], 'Y')
-        pass  # Skipping this test due to variable name mismatch
-
-
-class TestContextConditionedLoss:
-    """Test context-conditioned information loss."""
+class TestContextualKL:
+    """Test context-conditioned KL divergence loss."""
 
     def test_loss_varies_by_context(self):
-        """Loss should differ for different contexts."""
-        # Build mask advice DAG
+        """KL loss should differ for different contexts."""
         dag = build_mask_advice_dag()
 
         # Simple abstraction (ignores R)
@@ -175,11 +153,17 @@ class TestContextConditionedLoss:
         simple_dag = CausalDAG(vars_simple, parents_simple, {'M': cpt_M, 'I': cpt_I})
 
         # Compute loss in different contexts
-        loss_low_R = compute_context_conditioned_loss(dag, simple_dag, 'I', {'R': 0})
-        loss_high_R = compute_context_conditioned_loss(dag, simple_dag, 'I', {'R': 1})
+        loss_low_R = compute_contextual_kl(dag, simple_dag, 'I', {'R': 0})
+        loss_high_R = compute_contextual_kl(dag, simple_dag, 'I', {'R': 1})
 
         # Losses should be different
         assert loss_low_R != loss_high_R
+
+    def test_zero_loss_for_identical_model(self):
+        """KL should be 0 when true and compressed models agree."""
+        dag = build_simple_medical_dag()
+        kl = compute_contextual_kl(dag, dag, 'Y', {'T': 1})
+        assert np.isclose(kl, 0.0, atol=1e-10)
 
 
 class TestCompressionSpeaker:
@@ -244,39 +228,6 @@ class TestCompressionSpeaker:
         max_prob_high = max(probs_high.values())
 
         assert max_prob_high >= max_prob_low
-
-
-class TestCompressionListener:
-    """Test the CompressionListener class."""
-
-    def test_initial_beliefs(self):
-        """Listener should start with specified prior."""
-        simple_dag = build_simple_medical_dag()
-        complex_dag = build_complex_medical_dag()
-
-        listener = CompressionListener(
-            possible_dags={'simple': simple_dag, 'complex': complex_dag},
-            prior_complexity={'simple': 0.7, 'complex': 0.3}
-        )
-
-        assert listener.beliefs['simple'] == 0.7
-        assert listener.beliefs['complex'] == 0.3
-
-    def test_beliefs_normalized(self):
-        """Beliefs should always sum to 1."""
-        simple_dag = build_simple_medical_dag()
-        complex_dag = build_complex_medical_dag()
-
-        listener = CompressionListener(
-            possible_dags={'simple': simple_dag, 'complex': complex_dag},
-            prior_complexity={'simple': 0.7, 'complex': 0.3}
-        )
-
-        # Even unnormalized input should be normalized
-        listener.beliefs = {'simple': 2.0, 'complex': 3.0}
-        listener.normalize_beliefs()
-
-        assert np.isclose(sum(listener.beliefs.values()), 1.0)
 
 
 class TestContextDependentCompression:

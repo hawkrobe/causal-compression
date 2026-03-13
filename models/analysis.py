@@ -9,7 +9,7 @@ Functions:
 import numpy as np
 from typing import Dict, List, Optional
 
-from .dag import CausalDAG
+from .kinney_lombrozo import CausalDAG
 from .speaker import Utterance, CompressionSpeaker
 
 
